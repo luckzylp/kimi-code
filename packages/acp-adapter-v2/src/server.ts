@@ -1238,7 +1238,7 @@ function sessionSummaryToSessionInfo(summary: SessionSummary): SessionInfo {
  *  - `null` or non-array → `invalid_params` ("must be an array").
  *  - Each entry must be a non-empty absolute path string.
  *
- * Ported from the reference implementation at `E:/project/git/1/kimi-code`
+ * Ported from the reference implementation
  * (branch `feat/multi_root_workspace_support`).
  */
 export function validateAdditionalDirectories(dirs: unknown): string[] | undefined {
