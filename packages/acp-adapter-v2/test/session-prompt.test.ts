@@ -142,6 +142,51 @@ describe('AcpServer session/prompt', () => {
     expect(unsubscribeCount()).toBe(1);
   });
 
+  it('flushes sentence-sized chunks at boundary characters, all sharing one messageId', async () => {
+    const sessionId = 'sess-boundary';
+    const { session, unsubscribeCount } = makeScriptedSession(sessionId, [
+      { type: 'assistant.delta', sessionId, agentId: 'main', turnId: 1, delta: 'Hello, world.' } as Event,
+      { type: 'assistant.delta', sessionId, agentId: 'main', turnId: 1, delta: 'Second' } as Event,
+      { type: 'assistant.delta', sessionId, agentId: 'main', turnId: 1, delta: ' sentence.' } as Event,
+      { type: 'turn.ended', sessionId, agentId: 'main', turnId: 1, reason: 'completed' } as Event,
+    ]);
+    const harness = {
+      auth: { status: async () => AUTHED_STATUS },
+      createSession: async () => session,
+    } as unknown as KimiHarness;
+
+    const { agentStream, clientStream } = makeInMemoryStreamPair();
+    new AgentSideConnection((c) => new AcpServer(harness, c), agentStream);
+    const collecting = new CollectingClient();
+    const client = new ClientSideConnection(() => collecting, clientStream);
+
+    await client.newSession({ cwd: '/tmp/x', mcpServers: [] });
+    const response = await client.prompt({ sessionId, prompt: [textBlock('hi')] });
+    expect(response.stopReason).toBe('end_turn');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Each sentence-ending `.` triggers a flush: 'Hello, world.' and
+    // 'Second sentence.', never mid-token.
+    const chunks = collecting.promptUpdates.filter(
+      (n) => (n.update as { sessionUpdate?: string }).sessionUpdate === 'agent_message_chunk',
+    );
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]?.update).toMatchObject({
+      content: { type: 'text', text: 'Hello, world.' },
+    });
+    expect(chunks[1]?.update).toMatchObject({
+      content: { type: 'text', text: 'Second sentence.' },
+    });
+    // Both chunks belong to the same streamed message — the messageId is
+    // stable across a turn and UUID-formatted.
+    const id0 = (chunks[0]?.update as { messageId?: string }).messageId;
+    const id1 = (chunks[1]?.update as { messageId?: string }).messageId;
+    expect(id0).toBeTruthy();
+    expect(id1).toBe(id0);
+    expect(id0).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    expect(unsubscribeCount()).toBe(1);
+  });
+
   it('resolves with cancelled stopReason when turn.ended reason is cancelled', async () => {
     const sessionId = 'sess-B';
     const { session, unsubscribeCount } = makeScriptedSession(sessionId, [
@@ -405,7 +450,7 @@ describe('AcpServer session/prompt', () => {
     expect(unsubscribeCount()).toBe(1);
   });
 
-  it('flushes a separate chunk per 50ms window when deltas are spaced apart', async () => {
+  it('coalesces spaced-apart deltas into one chunk instead of per-window flushing', async () => {
     const sessionId = 'sess-window';
     const listeners = new Set<(event: Event) => void>();
     let unsubCount = 0;
@@ -419,7 +464,7 @@ describe('AcpServer session/prompt', () => {
         for (const fn of listeners) {
           fn({ type: 'assistant.delta', sessionId, agentId: 'main', turnId: 1, delta: ' second' } as Event);
         }
-        // turn.ended flush the tail without waiting for the window.
+        // turn.ended flush the tail without waiting for a size/boundary.
         for (const fn of listeners) {
           fn({ type: 'turn.ended', sessionId, agentId: 'main', turnId: 1, reason: 'completed' } as Event);
         }
@@ -448,16 +493,13 @@ describe('AcpServer session/prompt', () => {
     expect(response.stopReason).toBe('end_turn');
 
     await new Promise((resolve) => setTimeout(resolve, 20));
-    // 'first' exceeded the 50ms window before ' second' arrived, so it
-    // flushed on its own; the tail ' second' lands on turn.ended.
-    expect(collecting.promptUpdates).toHaveLength(2);
+    // 'first second' never reaches MIN_ASSISTANT_CHUNK_CHARS nor a
+    // sentence boundary, so it must NOT be split by a time window — it
+    // coalesces into a single chunk flushed on turn.ended.
+    expect(collecting.promptUpdates).toHaveLength(1);
     expect(collecting.promptUpdates[0]?.update).toMatchObject({
       sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: 'first' },
-    });
-    expect(collecting.promptUpdates[1]?.update).toMatchObject({
-      sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: ' second' },
+      content: { type: 'text', text: 'first second' },
     });
     expect(unsubCount).toBe(1);
   });

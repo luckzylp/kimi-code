@@ -256,6 +256,41 @@ describe('AcpServer tool-call streaming', () => {
     });
   });
 
+  it('does not emit agent_thought_chunk for empty thinking deltas', async () => {
+    const sessionId = 'sess-thinking-empty';
+    const session = makeScriptedSession(sessionId, [
+      { type: 'thinking.delta', sessionId, agentId: 'main', turnId: 1, delta: '' } as Event,
+      { type: 'thinking.delta', sessionId, agentId: 'main', turnId: 1, delta: '   ' } as Event,
+      { type: 'thinking.delta', sessionId, agentId: 'main', turnId: 1, delta: 'hmm' } as Event,
+      { type: 'turn.ended', sessionId, agentId: 'main', turnId: 1, reason: 'completed' } as Event,
+    ]);
+    const harness = {
+      auth: { status: async () => AUTHED_STATUS },
+      createSession: async () => session,
+    } as unknown as KimiHarness;
+
+    const { agentStream, clientStream } = makeInMemoryStreamPair();
+    new AgentSideConnection((c) => new AcpServer(harness, c), agentStream);
+    const collecting = new CollectingClient();
+    const client = new ClientSideConnection(() => collecting, clientStream);
+
+    await client.newSession({ cwd: '/tmp/x', mcpServers: [] });
+    await client.prompt({ sessionId, prompt: [textBlock('go')] });
+    await flushNdjson();
+
+    // Empty/whitespace deltas never become a phantom thought chunk; only
+    // the non-empty 'hmm' reaches the wire.
+    expect(
+      collecting.promptUpdates.filter(
+        (n) => (n.update as { sessionUpdate?: string }).sessionUpdate === 'agent_thought_chunk',
+      ),
+    ).toHaveLength(1);
+    expect(collecting.promptUpdates[0]?.update).toMatchObject({
+      sessionUpdate: 'agent_thought_chunk',
+      content: { type: 'text', text: 'hmm' },
+    });
+  });
+
   it('relays only `status` tool.progress updates as title-bearing tool_call_update', async () => {
     const sessionId = 'sess-progress';
     const turnId = 1;

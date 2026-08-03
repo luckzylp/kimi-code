@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   RequestError,
   type AgentSideConnection,
@@ -1075,25 +1076,26 @@ export class AcpSession {
       // Coalescing buffer for `assistant.delta` events. Lives in the
       // Promise executor closure (like `argsByToolCall`) so each
       // `prompt()` invocation flushes independently and no text leaks
-      // across concurrent or sequential turns. See
-      // `ASSISTANT_DELTA_FLUSH_MS` for the why; `flushAssistantText`
-      // pushes one merged `agent_message_chunk` per window, and
+      // across concurrent or sequential turns. `assistant.delta` tokens
+      // accumulate here; `pumpAssistantText` decides when they warrant a
+      // wire `agent_message_chunk` (sentence-sized, never token-sized —
+      // see `MIN_ASSISTANT_CHUNK_CHARS` for the why), and
       // `flushAssistantTextNow` is the `turn.ended` / error counterpart
-      // of the TUI's `finalizeAssistantStream`.
+      // of the TUI's `finalizeAssistantStream`. Every chunk of a turn
+      // shares `messageId` so the client can group buffers into one
+      // streamed message.
       let pendingAssistantText = '';
+      let pendingMessageId: string | undefined;
       let assistantFlushTimer: ReturnType<typeof setTimeout> | undefined;
-      let lastAssistantFlushAt: number | undefined;
-      const flushAssistantText = (): void => {
-        if (pendingAssistantText.length === 0) return;
-        const text = pendingAssistantText;
-        pendingAssistantText = '';
-        lastAssistantFlushAt = Date.now();
+      const ensureMessageId = (): string => (pendingMessageId ??= randomUUID());
+      const sendAssistantText = (text: string): void => {
         conn
           .sessionUpdate({
             sessionId,
             update: {
               sessionUpdate: 'agent_message_chunk',
               content: { type: 'text', text },
+              messageId: ensureMessageId(),
             },
           })
           .catch((err) => {
@@ -1103,29 +1105,43 @@ export class AcpSession {
             });
           });
       };
-      const scheduleAssistantFlush = (): void => {
-        if (assistantFlushTimer !== undefined) return;
-        // Mirror the TUI's `scheduleFlush` pacing: delay the first
-        // flush so the very first delta is still coalesced, then keep
-        // a steady window cadence between flushes.
-        const delay =
-          lastAssistantFlushAt === undefined
-            ? ASSISTANT_DELTA_FLUSH_MS
-            : Math.max(
-                0,
-                ASSISTANT_DELTA_FLUSH_MS - (Date.now() - lastAssistantFlushAt),
-              );
-        assistantFlushTimer = setTimeout(() => {
-          assistantFlushTimer = undefined;
-          flushAssistantText();
-        }, delay);
-      };
-      const flushAssistantTextNow = (): void => {
+      const flushAssistantText = (): void => {
         if (assistantFlushTimer !== undefined) {
           clearTimeout(assistantFlushTimer);
           assistantFlushTimer = undefined;
         }
+        if (pendingAssistantText.length === 0) return;
+        const text = pendingAssistantText;
+        pendingAssistantText = '';
+        sendAssistantText(text);
+      };
+      const pumpAssistantText = (): void => {
+        const text = pendingAssistantText;
+        if (text.length === 0) return;
+        const lastChar = text.charAt(text.length - 1);
+        if (
+          text.length >= MIN_ASSISTANT_CHUNK_CHARS ||
+          ASSISTANT_CHUNK_BOUNDARY_CHARS.has(lastChar)
+        ) {
+          flushAssistantText();
+          return;
+        }
+        // So far the buffer is neither big enough nor at a sentence
+        // boundary. Arm a one-shot liveness flush so a slow turn that
+        // stalls mid-sentence still shows progress before `turn.ended`
+        // forces the final flush.
+        if (assistantFlushTimer === undefined) {
+          assistantFlushTimer = setTimeout(() => {
+            assistantFlushTimer = undefined;
+            flushAssistantText();
+          }, ASSISTANT_CHUNK_MAX_AGE_MS);
+        }
+      };
+      const flushAssistantTextNow = (): void => {
         flushAssistantText();
+        // A flush marks the end of one streamed message; give the next
+        // turn a fresh id (a change in messageId signals a new message).
+        pendingMessageId = undefined;
       };
       const unsub = this.session.onEvent((event) => {
         if (
@@ -1181,17 +1197,24 @@ export class AcpSession {
           // append-only, and forwarding 1-2 token deltas individually
           // makes clients like Zed re-parse the message's markdown on
           // every fragment, shredding tables/lists/code fences. The
-          // scheduled flush keeps the stream pumping (the underlying
-          // `sessionUpdate` still serializes onto the ndjson stream),
-          // and we log push failures rather than dropping them.
+          // pump flushes at sentence / minimum-size / liveness-age
+          // boundaries (see `MIN_ASSISTANT_CHUNK_CHARS`), keeping the
+          // stream pumping while still pushing paragraph-scale chunks
+          // (the underlying `sessionUpdate` still serializes onto the
+          // ndjson stream), and we log push failures rather than
+          // dropping them.
           pendingAssistantText += event.delta;
-          scheduleAssistantFlush();
+          pumpAssistantText();
           return;
         }
         if (event.type === 'thinking.delta') {
           if (!isFromMainAgent(event)) return;
+          // Skip empty deltas: a blank `agent_thought_chunk` (text `""`)
+          // is not a thinking update and misleads clients into rendering
+          // phantom paragraphs. Only non-empty thinking reaches the wire.
+          if (event.delta.trim().length === 0) return;
           conn
-            .sessionUpdate(thinkingDeltaToSessionUpdate(sessionId, event))
+            .sessionUpdate(thinkingDeltaToSessionUpdate(sessionId, event, pendingMessageId))
             .catch((err) => {
               log.warn('acp: failed to push agent_thought_chunk', {
                 sessionId,
@@ -1782,15 +1805,34 @@ function authRequiredFromUnknown(err: unknown): RequestError | undefined {
 const MAIN_AGENT_ID = 'main';
 
 /**
- * Coalescing window for consecutive `assistant.delta` events. ACP's
- * `agent_message_chunk` is an append-only notification, so every delta
- * forwarded separately forces the client to re-parse the message's
+ * Coalescing policy for consecutive `assistant.delta` events. ACP's
+ * `agent_message_chunk` is an append-only notification, so forwarding
+ * every delta separately forces the client to re-parse the message's
  * markdown on a 1-2 token granularity, which shreds tables, lists and
  * code fences into word-per-line fragments (observed in Zed). Buffer
- * deltas and flush them as one chunk per window — the same throttle
- * `STREAMING_UI_FLUSH_MS` uses in the TUI's `streaming-ui`.
+ * deltas and flush them as one chunk per sentence / per
+ * {@link MIN_ASSISTANT_CHUNK_CHARS}-size / per
+ * {@link ASSISTANT_CHUNK_MAX_AGE_MS}-age, so each wire chunk carries a
+ * readable, paragraph-scale amount of text instead of a 50ms window of
+ * whatever tokens happened to land.
  */
-const ASSISTANT_DELTA_FLUSH_MS = 50;
+const MIN_ASSISTANT_CHUNK_CHARS = 20;
+
+/**
+ * Liveness safety net for the message buffer: if a turn emits text that
+ * never reaches {@link MIN_ASSISTANT_CHUNK_CHARS} nor a sentence
+ * boundary (e.g. the provider stalls mid-sentence), flush anyway after
+ * this long so the client still sees progress before `turn.ended`.
+ */
+const ASSISTANT_CHUNK_MAX_AGE_MS = 500;
+
+/**
+ * Characters that end a flushable text fragment. A buffered run ending
+ * in one of these is a natural ACP chunk boundary: the client can apply
+ * it without mid-sentence re-flow. Sentence punctuation plus the newline
+ * (code fences / list items land line-by-line, never word-by-word).
+ */
+const ASSISTANT_CHUNK_BOUNDARY_CHARS = new Set(['.', '。', '!', '！', '?', '？', '\n']);
 
 /**
  * Parse a tool call's `arguments` field (kosong wire format: a JSON
