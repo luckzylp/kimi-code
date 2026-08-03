@@ -461,4 +461,45 @@ describe('AcpServer session/prompt', () => {
     });
     expect(unsubCount).toBe(1);
   });
+
+  it('pushes a usage_update notification after the turn ends', async () => {
+    const sessionId = 'sess-usage-prompt';
+    const { session: baseSession, unsubscribeCount } = makeScriptedSession(sessionId, [
+      { type: 'assistant.delta', sessionId, agentId: 'main', turnId: 1, delta: 'ok' } as Event,
+      { type: 'turn.ended', sessionId, agentId: 'main', turnId: 1, reason: 'completed' } as Event,
+    ]);
+    const session = {
+      ...baseSession,
+      getStatus: async () => ({
+        thinkingEffort: 'off',
+        contextTokens: 53000,
+        maxContextTokens: 200000,
+      }),
+    } as Session;
+    const harness = {
+      auth: { status: async () => AUTHED_STATUS },
+      createSession: async () => session,
+    } as unknown as KimiHarness;
+
+    const { agentStream, clientStream } = makeInMemoryStreamPair();
+    new AgentSideConnection((c) => new AcpServer(harness, c), agentStream);
+    const collecting = new CollectingClient();
+    const client = new ClientSideConnection(() => collecting, clientStream);
+
+    await client.newSession({ cwd: '/tmp/x', mcpServers: [] });
+    const response = await client.prompt({ sessionId, prompt: [textBlock('hi')] });
+    expect(response.stopReason).toBe('end_turn');
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const usage = collecting.promptUpdates.find(
+      (n) => (n.update as { sessionUpdate?: string }).sessionUpdate === 'usage_update',
+    );
+    expect(usage?.update).toMatchObject({
+      sessionUpdate: 'usage_update',
+      used: 53000,
+      size: 200000,
+    });
+    expect(unsubscribeCount()).toBe(1);
+  });
 });

@@ -54,6 +54,7 @@ import {
   toolProgressToSessionUpdate,
   toolResultToSessionUpdate,
   turnEndReasonToStopReason,
+  usageUpdateNotification,
 } from './events-map';
 import { acpModeToToggles, DEFAULT_MODE_ID, isAcpModeId, type AcpModeId } from './modes';
 import { outcomeToQuestionAnswer, questionItemToPermissionOptions } from './question';
@@ -369,6 +370,10 @@ export class AcpSession {
         (await this.readEffectiveThinkingEffort()) ?? this.currentThinkingEffortInternal;
     }
     await this.emitConfigOptionUpdate();
+    // A model switch can change the effective context window size
+    // (dynamic windows / different max context). Re-report usage so the
+    // client's context indicator tracks the new limit (RFC usage_update).
+    await this.emitUsageUpdate();
   }
 
   /**
@@ -544,6 +549,52 @@ export class AcpSession {
       await this.conn.sessionUpdate(configOptionUpdateNotification(this.id, snapshot));
     } catch (err) {
       log.warn('acp: failed to emit config_option_update', {
+        sessionId: this.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Push a `usage_update` session notification carrying the session's
+   * current context window utilization (`used` / `size`), read from
+   * the underlying SDK session's status channel.
+   *
+   * The Session Context Size and Cost RFD asks agents to report this
+   * whenever they have current data — after session setup (new / load /
+   * resume), after a prompt turn completes, and anytime the window
+   * changes significantly (model switch, compaction). `cost` is
+   * deliberately omitted: this adapter does not track cumulative
+   * session cost yet, and ACP marks the field optional.
+   *
+   * Skips emission when the SDK session exposes no status channel
+   * (partial-stub unit tests) or reports no meaningful context window
+   * (`maxContextTokens <= 0` / non-finite `used` or `size`) — the RFD
+   * defines no `null` `size` state, so "cannot report" means "stay
+   * silent". Errors during the read or the push are caught and logged
+   * at `warn` — same policy as {@link emitConfigOptionUpdate}: pushing
+   * a session update is a streaming concern, not load-bearing.
+   */
+  async emitUsageUpdate(): Promise<void> {
+    if (typeof this.session.getStatus !== 'function') return;
+    try {
+      const status = await this.session.getStatus();
+      const { contextTokens, maxContextTokens } = status;
+      if (
+        !Number.isFinite(contextTokens) ||
+        !Number.isFinite(maxContextTokens) ||
+        maxContextTokens <= 0
+      ) {
+        return;
+      }
+      await this.conn.sessionUpdate(
+        usageUpdateNotification(this.id, {
+          used: contextTokens,
+          size: maxContextTokens,
+        }),
+      );
+    } catch (err) {
+      log.warn('acp: failed to emit usage_update', {
         sessionId: this.id,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -931,6 +982,10 @@ export class AcpSession {
         }
         if (event.type === 'compaction.completed') {
           settle(() => resolve({ kind: 'completed', result: event.result }));
+          // Compaction shrinks the context substantially — re-report
+          // usage so the client's context indicator reflects the drop
+          // (RFC usage_update).
+          void this.emitUsageUpdate();
           return;
         }
         if (event.type === 'compaction.cancelled') {
@@ -1322,6 +1377,11 @@ export class AcpSession {
             this.currentTurnId = undefined;
             unsub();
           }
+          // The turn just consumed tokens — re-report context usage now
+          // that `getStatus` reflects the post-turn state (RFC
+          // usage_update). Fire-and-forget: the prompt response resolves
+          // immediately after and the push is a streaming concern.
+          void this.emitUsageUpdate();
           resolve({ stopReason: turnEndReasonToStopReason(event.reason, event.error) });
         }
       });

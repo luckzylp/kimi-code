@@ -525,3 +525,33 @@ export function configOptionUpdateNotification(
     },
   };
 }
+
+/**
+ * Build a `usage_update` session notification carrying the session's
+ * current context window utilization.
+ *
+ * Emitted by {@link AcpSession.emitUsageUpdate} whenever the adapter
+ * has current context data — after session setup (new / load / resume),
+ * after a prompt turn ends, and after events that shift the window
+ * (model switch, compaction). `used` / `size` are the raw token
+ * values so clients can compute `remaining` and `percentage`.
+ *
+ * The discriminator literal `'usage_update'` matches the SDK's
+ * `UsageUpdate & { sessionUpdate: 'usage_update' }` arm of the
+ * `SessionUpdate` union (`types.gen.d.ts:4862-4863`). The `cost` field
+ * is deliberately omitted — this adapter does not track cumulative
+ * session cost yet, and ACP marks it optional.
+ */
+export function usageUpdateNotification(
+  sessionId: string,
+  usage: { used: number; size: number },
+): SessionNotification {
+  return {
+    sessionId,
+    update: {
+      sessionUpdate: 'usage_update',
+      used: usage.used,
+      size: usage.size,
+    },
+  };
+}

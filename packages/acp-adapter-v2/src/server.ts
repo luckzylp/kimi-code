@@ -424,6 +424,10 @@ export class AcpServer implements Agent {
       currentThinkingEffort,
       DEFAULT_MODE_ID,
     );
+    // Report the fresh session's context window once the session id
+    // exists (RFC usage_update). Fire-and-forget like the commands push
+    // below — it reads the live status and is a streaming concern.
+    void acpSession.emitUsageUpdate();
     this.scheduleAvailableCommandsUpdate(session.id);
     return {
       sessionId: session.id,
@@ -618,6 +622,11 @@ export class AcpServer implements Agent {
       currentThinkingEffort,
     );
     this.sessions.set(session.id, acpSession);
+    // Re-report context usage for the restored session (RFC
+    // usage_update) so a client connecting mid-session immediately sees
+    // accurate context/cost state. Fire-and-forget: the read is wrapped
+    // in its own error handling and never blocks the response.
+    void acpSession.emitUsageUpdate();
     const configOptions = await buildSessionConfigOptions(
       this.harness,
       currentModelId,

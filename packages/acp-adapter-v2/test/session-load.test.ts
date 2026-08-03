@@ -344,4 +344,36 @@ describe('AcpServer session/load replay', () => {
     if (thinking?.type !== 'select') throw new Error('thinking option must be a select');
     expect(thinking.currentValue).toBe('on');
   });
+
+  it('pushes a usage_update notification after session/load with the restored context', async () => {
+    const sessionId = 'sess-usage-load';
+    const session = {
+      ...makeSessionWithHistory(sessionId, []),
+      getStatus: async () => ({
+        thinkingEffort: 'off',
+        contextTokens: 12345,
+        maxContextTokens: 200000,
+      }),
+    } as Session;
+    const harness = makeHarness({ hasUsableToken: true, session });
+    const { agentStream, clientStream } = makeInMemoryStreamPair();
+
+    void new AgentSideConnection((c) => new AcpServer(harness, c), agentStream);
+    const client = new CapturingClient();
+    const clientConn = new ClientSideConnection((_a) => client, clientStream);
+
+    await clientConn.loadSession({ sessionId, cwd: '/tmp/x', mcpServers: [] });
+
+    // Give the agent side a tick to flush the fire-and-forget push.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const usage = client.updates.find(
+      (n) => (n.update as { sessionUpdate?: string }).sessionUpdate === 'usage_update',
+    );
+    expect(usage?.update).toMatchObject({
+      sessionUpdate: 'usage_update',
+      used: 12345,
+      size: 200000,
+    });
+  });
 });

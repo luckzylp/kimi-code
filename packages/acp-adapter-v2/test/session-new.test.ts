@@ -34,6 +34,23 @@ class StubClient implements Client {
   }
 }
 
+class CollectingClient implements Client {
+  readonly updates: SessionNotification[] = [];
+
+  async requestPermission(_p: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+    throw new Error('CollectingClient.requestPermission should not be called in session-new test');
+  }
+  async sessionUpdate(n: SessionNotification): Promise<void> {
+    this.updates.push(n);
+  }
+  async writeTextFile(_p: WriteTextFileRequest): Promise<WriteTextFileResponse> {
+    throw new Error('CollectingClient.writeTextFile should not be called in session-new test');
+  }
+  async readTextFile(_p: ReadTextFileRequest): Promise<ReadTextFileResponse> {
+    throw new Error('CollectingClient.readTextFile should not be called in session-new test');
+  }
+}
+
 function makeInMemoryStreamPair(): {
   agentStream: ReturnType<typeof ndJsonStream>;
   clientStream: ReturnType<typeof ndJsonStream>;
@@ -266,10 +283,91 @@ describe('AcpServer session/new', () => {
 
       const response = await client.newSession({ cwd: '/tmp/work', mcpServers: [] });
 
-      expect(fakeSession.getStatus).toHaveBeenCalledOnce();
+      // getStatus is consulted for both the thinking-effort resolution
+      // and the usage_update push; what matters here is that the read
+      // was attempted and the fallback won.
+      expect(fakeSession.getStatus).toHaveBeenCalled();
       const thinking = response.configOptions?.find((option) => option.id === 'thinking');
       if (thinking?.type !== 'select') throw new Error('thinking option must be a select');
       expect(thinking.currentValue).toBe(expected);
     },
   );
+
+  it('pushes a usage_update notification after session/new with the session context window', async () => {
+    const captured: CapturedCall[] = [];
+    const sessionId = 'sess-usage-new';
+    const fakeSession = {
+      id: sessionId,
+      prompt: async () => undefined,
+      cancel: async () => undefined,
+      onEvent: () => () => undefined,
+      getStatus: async () => ({
+        thinkingEffort: 'off',
+        contextTokens: 53000,
+        maxContextTokens: 200000,
+      }),
+    } as unknown as Session;
+    const harness = {
+      auth: { status: async () => AUTHED_STATUS },
+      createSession: async (options: { id?: string; workDir: string }) => {
+        captured.push({ options });
+        return Object.assign({}, fakeSession, { id: options.id ?? sessionId }) as Session;
+      },
+      getConfig: async () => ({ providers: {}, models: {} }),
+    } as unknown as KimiHarness;
+
+    const { agentStream, clientStream } = makeInMemoryStreamPair();
+    new AgentSideConnection((c) => new AcpServer(harness, c), agentStream);
+    const collecting = new CollectingClient();
+    const client = new ClientSideConnection(() => collecting, clientStream);
+
+    await client.newSession({ cwd: '/tmp/work', mcpServers: [] });
+
+    // Give the agent side a tick to flush queued sessionUpdate writes.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const usage = collecting.updates.find(
+      (n) => (n.update as { sessionUpdate?: string }).sessionUpdate === 'usage_update',
+    );
+    expect(usage?.update).toMatchObject({
+      sessionUpdate: 'usage_update',
+      used: 53000,
+      size: 200000,
+    });
+  });
+
+  it('skips usage_update when the session reports no meaningful context window', async () => {
+    const captured: CapturedCall[] = [];
+    const sessionId = 'sess-usage-none';
+    const fakeSession = {
+      id: sessionId,
+      prompt: async () => undefined,
+      cancel: async () => undefined,
+      onEvent: () => () => undefined,
+      getStatus: async () => ({ thinkingEffort: 'off' }),
+    } as unknown as Session;
+    const harness = {
+      auth: { status: async () => AUTHED_STATUS },
+      createSession: async (options: { id?: string; workDir: string }) => {
+        captured.push({ options });
+        return Object.assign({}, fakeSession, { id: options.id ?? sessionId }) as Session;
+      },
+      getConfig: async () => ({ providers: {}, models: {} }),
+    } as unknown as KimiHarness;
+
+    const { agentStream, clientStream } = makeInMemoryStreamPair();
+    new AgentSideConnection((c) => new AcpServer(harness, c), agentStream);
+    const collecting = new CollectingClient();
+    const client = new ClientSideConnection(() => collecting, clientStream);
+
+    await client.newSession({ cwd: '/tmp/work', mcpServers: [] });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // maxContextTokens is absent → the adapter stays silent (the RFD
+    // defines no `null` `size` state).
+    const usage = collecting.updates.filter(
+      (n) => (n.update as { sessionUpdate?: string }).sessionUpdate === 'usage_update',
+    );
+    expect(usage).toHaveLength(0);
+  });
 });
