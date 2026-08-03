@@ -26,7 +26,7 @@ import {
   runAcpServer,
   type AvailableCommand,
   type SlashCommandsSnapshot,
-} from '@moonshot-ai/acp-adapter';
+} from '@moonshot-ai/acp-adapter-v2';
 import { createKimiHarness, type Session, type SkillSummary } from '@moonshot-ai/kimi-code-sdk';
 
 import { KIMI_CODE_HOME_ENV } from '#/constant/app';

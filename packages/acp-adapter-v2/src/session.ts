@@ -828,8 +828,11 @@ export class AcpSession {
     // ACP clients send slash commands as plain text `ContentBlock`s in
     // `session/prompt`. Intercept only commands the adapter can execute
     // directly: skills route to `Session.activateSkill(...)`, ACP-owned
-    // built-ins route to local SDK queries, and unknown slash commands are
-    // reported locally instead of being forwarded to the model as text.
+    // built-ins route to local SDK queries. Unknown slash commands (client
+    // UI builtins the adapter does not own, like the TUI's /clear, or a
+    // slash-prefixed Unix path that happens to lead the prompt) are NOT
+    // blocked locally — they fall through to `Session.prompt` as regular
+    // prompt text, preserving the full user input.
     const intent = detectLeadingSlashIntent(blocks, this.skillCommandMap);
     if (intent.kind === 'skill') {
       this.emitTelemetry('acp_skill_activated', { skill_name: intent.skillName });
@@ -846,10 +849,10 @@ export class AcpSession {
     if (intent.kind === 'builtin') {
       return this.runBuiltInCommand(intent.name, intent.args);
     }
-    if (intent.kind === 'unknown') {
-      return this.runUnknownSlashCommand(intent.name);
-    }
 
+    // `skill` / `builtin` / `unknown` / `passthrough` converge here: an
+    // unknown slash form (e.g. /clear, or a slash-prefixed path) is treated
+    // as ordinary prompt text and forwarded to the model verbatim.
     return this.runTurnBody(sessionId, conn, () => this.session.prompt(parts));
   }
 
@@ -885,13 +888,6 @@ export class AcpSession {
     } catch (error) {
       await this.emitLocalCommandMessage(`/${name} failed: ${errorMessage(error)}`);
     }
-    return { stopReason: 'end_turn' };
-  }
-
-  private async runUnknownSlashCommand(name: string): Promise<PromptResponse> {
-    await this.emitLocalCommandMessage(
-      `Unknown ACP command: /${name}. Use /help to see available commands.`,
-    );
     return { stopReason: 'end_turn' };
   }
 

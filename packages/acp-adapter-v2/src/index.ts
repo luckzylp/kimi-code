@@ -10,7 +10,6 @@ export type { AcpVersionSpec } from './version';
 export { TERMINAL_AUTH_METHOD, buildTerminalAuthMethod } from './auth-methods';
 export { AcpServer, runAcpServer, runAcpServerWithStream } from './server';
 export type { SlashCommandsSnapshot } from './server';
-export { validateAdditionalDirectories } from './server';
 export { AcpSession } from './session';
 export {
   acpBlocksToPromptParts,

@@ -76,10 +76,11 @@ describe('slash', () => {
       });
     });
 
-    it('reports unknown slash commands instead of passing them to the model', () => {
-      // TUI builtins like /clear are not ACP-executable. Report them as
-      // unknown so the adapter can render a local error instead of sending
-      // the literal command to the model.
+    it('classifies TUI builtins like /clear as unknown slash commands', () => {
+      // TUI builtins like /clear are not ACP-executable. Detection reports
+      // them as `unknown` (distinct from `passthrough`) so prompt() can
+      // decide how to route — the adapter forwards the literal command to
+      // the model as regular prompt text instead of blocking it.
       expect(detectSlashIntent('/clear', map)).toEqual({
         kind: 'unknown',
         name: 'clear',

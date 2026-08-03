@@ -298,7 +298,7 @@ describe('AcpSession slash routing', () => {
     expect(calls.activate).toEqual([{ name: 'foo', args: undefined }]);
   });
 
-  it('intercepts unknown slash commands locally and lets non-slash text flow to Session.prompt', async () => {
+  it('forwards unknown slash commands to the model and lets non-slash text flow to Session.prompt', async () => {
     const sessionId = 'sess-slash-C';
     const { session, calls } = makeFakeSession(sessionId, [
       endedTurn(sessionId),
@@ -342,7 +342,7 @@ describe('AcpSession slash routing', () => {
     expect(calls.activate).toEqual([]);
   });
 
-  it('intercepts a `/skill:foo` form locally when no skillCommandMap has been seeded', async () => {
+  it('forwards a `/skill:foo` form to the model when no skillCommandMap has been seeded', async () => {
     // No `slashCommands` option at all → the adapter's internal map
     // stays empty, so `/skill:foo` resolves to no skill. The adapter
     // now forwards unknown slash commands to the model as regular

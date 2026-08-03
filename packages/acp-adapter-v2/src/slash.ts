@@ -3,9 +3,11 @@
 // Copied from the TUI's `apps/kimi-code/src/tui/commands/parse.ts` and the
 // skill-resolution slice of `apps/kimi-code/src/tui/commands/resolve.ts`
 // (`resolveSkillCommand`). ACP only intercepts commands the adapter can execute
-// directly: skills plus the small ACP-owned built-in command set. Other slash
-// inputs are reported as unknown commands instead of being silently sent to the
-// model as prompt text.
+// directly: skills plus the small ACP-owned built-in command set. Everything
+// else — client UI builtins the adapter does not own, and slash-prefixed Unix
+// paths that happen to lead the prompt — is classified as `unknown` so
+// `AcpSession.prompt` can forward the full text to the model as a regular
+// prompt instead of blocking it.
 //
 // Sync target: if the TUI parser's accepted grammar changes (e.g. the
 // "no `/` inside name" rule), update the duplicate here too.

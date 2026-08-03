@@ -7,8 +7,8 @@
  */
 
 import { Readable, Writable } from 'node:stream';
-import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 
 import {
   AgentSideConnection,

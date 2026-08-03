@@ -2,7 +2,7 @@
  * `kimi acp`
  *
  * Verifies that the ACP sub-command is registered on the program and
- * that the action wires the harness into `@moonshot-ai/acp-adapter`'s
+ * that the action wires the harness into `@moonshot-ai/acp-adapter-v2`'s
  * `runAcpServer` (the real server is stubbed so the test doesn't
  * actually take over stdio).
  */
@@ -10,12 +10,12 @@
 import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@moonshot-ai/acp-adapter', () => ({
+vi.mock('@moonshot-ai/acp-adapter-v2', () => ({
   ACP_BUILTIN_SLASH_COMMANDS: [],
   runAcpServer: vi.fn(async () => undefined),
 }));
 
-import { runAcpServer } from '@moonshot-ai/acp-adapter';
+import { runAcpServer } from '@moonshot-ai/acp-adapter-v2';
 
 import { registerAcpCommand } from '#/cli/sub/acp';
 

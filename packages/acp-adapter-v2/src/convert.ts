@@ -28,6 +28,16 @@ export function acpBlocksToPromptParts(
   const out: PromptPart[] = [];
   for (const block of blocks) {
     if (block.type === 'text') {
+      // Zed splits text around `@file` references into multiple blocks, and
+      // the separator between two adjacent references can arrive as its own
+      // whitespace-only text block. Passed through verbatim it becomes a text
+      // part that the SDK's prompt-input validation rejects
+      // (REQUEST_PROMPT_INPUT_EMPTY), surfacing as an internal error. The
+      // engine projector drops the same parts on send, so skipping them here
+      // is safe and keeps the prompt from ever carrying a blank text part.
+      if (block.text.trim().length === 0) {
+        continue;
+      }
       out.push({ type: 'text', text: block.text });
       continue;
     }

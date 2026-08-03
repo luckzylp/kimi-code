@@ -47,17 +47,17 @@ export class AcpKaos implements Kaos {
     private readonly inner: Kaos,
     /**
      * Workspace root paths (cwd + additionalDirectories). File operations
-     * targeting paths within these roots are routed through ACP reverse-RPC;
-     * everything else falls through to {@link homeRoot} or the local
-     * filesystem — see {@link shouldRouteToLocal}.
+     * targeting paths within these roots are routed through ACP reverse-RPC.
+     * Paths outside the workspace are routed by {@link shouldRouteToLocal}:
+     * inside {@link homeRoot} → local `inner` Kaos, otherwise → ACP bridge.
      */
     private readonly workspaceRoots: readonly string[] = [],
     /**
      * The agent's own data directory (resolved `~/.kimi-code`). Read/write
      * targeting paths within this root are served by the local `inner` Kaos
      * so session-internal files (plan documents, session metadata) are not
-     * blocked by the ACP client's workspace boundary. If unset, the only
-     * local fallback is the {@link workspaceRoots} short-circuit below.
+     * blocked by the ACP client's workspace boundary. If unset, no local
+     * fallback applies — every path routes through ACP.
      */
     private readonly homeRoot?: string,
   ) {}

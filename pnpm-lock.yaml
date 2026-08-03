@@ -74,9 +74,9 @@ importers:
 
   apps/kimi-code:
     devDependencies:
-      '@moonshot-ai/acp-adapter':
+      '@moonshot-ai/acp-adapter-v2':
         specifier: workspace:^
-        version: link:../../packages/acp-adapter
+        version: link:../../packages/acp-adapter-v2
       '@moonshot-ai/agent-core-v2':
         specifier: workspace:^
         version: link:../../packages/agent-core-v2
@@ -550,9 +550,6 @@ importers:
       '@agentclientprotocol/sdk':
         specifier: ^0.23.0
         version: 0.23.0(zod@4.3.6)
-      '@moonshot-ai/agent-core-v2':
-        specifier: workspace:^
-        version: link:../agent-core-v2
       '@moonshot-ai/kaos':
         specifier: workspace:^
         version: link:../kaos
