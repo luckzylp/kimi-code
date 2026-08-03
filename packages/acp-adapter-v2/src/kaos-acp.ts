@@ -48,11 +48,18 @@ export class AcpKaos implements Kaos {
     /**
      * Workspace root paths (cwd + additionalDirectories). File operations
      * targeting paths within these roots are routed through ACP reverse-RPC;
-     * everything else (e.g. ~/.kimi-code/sessionXXX/plan.md) falls through
-     * to the local filesystem so session-internal writes are not blocked by
-     * the ACP client's workspace boundary.
+     * everything else falls through to {@link homeRoot} or the local
+     * filesystem — see {@link shouldRouteToLocal}.
      */
     private readonly workspaceRoots: readonly string[] = [],
+    /**
+     * The agent's own data directory (resolved `~/.kimi-code`). Read/write
+     * targeting paths within this root are served by the local `inner` Kaos
+     * so session-internal files (plan documents, session metadata) are not
+     * blocked by the ACP client's workspace boundary. If unset, the only
+     * local fallback is the {@link workspaceRoots} short-circuit below.
+     */
+    private readonly homeRoot?: string,
   ) {}
 
   // ── identity ────────────────────────────────────────────────────────
@@ -88,19 +95,37 @@ export class AcpKaos implements Kaos {
     return this.inner.chdir(path);
   }
 
-  /**
-   * Returns true when `target` is inside one of the workspace root
-   * directories. Used to decide whether to route through ACP reverse-RPC
-   * (paths inside the workspace) or through the local filesystem (session-
-   * internal paths like ~/.kimi-code/sessionXXX/plan.md).
-   */
   private isWithinWorkspaceRoots(target: string): boolean {
     if (this.workspaceRoots.length === 0) return true; // no roots = always ACP
-    // Use the platform-appropriate path module so Unix-style paths in
-    // tests (and cross-platform scenarios) resolve correctly.
+    return this.isWithinRoot(this.workspaceRoots, target);
+  }
+
+  /**
+   * True when `target` is inside the agent's own `~/.kimi-code` data dir.
+   * Uses the same path-boundary logic as the workspace roots so a sibling
+   * like `~/.kimi-codeX` does not match.
+   */
+  private isWithinHomeRoot(target: string): boolean {
+    if (this.homeRoot === undefined) return false;
+    return this.isWithinRoot([this.homeRoot], target);
+  }
+
+  /**
+   * Three-way routing decision for a file path:
+   * 1. inside {@link workspaceRoots} → ACP bridge (host's explicit grant;
+   *    wins over homeRoot if a path is in both),
+   * 2. else inside {@link homeRoot} → local `inner` Kaos,
+   * 3. else → ACP bridge.
+   */
+  private shouldRouteToLocal(target: string): boolean {
+    if (this.isWithinWorkspaceRoots(target)) return false;
+    return this.isWithinHomeRoot(target);
+  }
+
+  private isWithinRoot(roots: readonly string[], target: string): boolean {
     const pm = this.inner.pathClass() === 'win32' ? path.win32 : path.posix;
     const resolved = pm.isAbsolute(target) ? target : pm.resolve(this.inner.getcwd(), target);
-    for (const root of this.workspaceRoots) {
+    for (const root of roots) {
       const resolvedRoot = pm.isAbsolute(root) ? root : pm.resolve(this.inner.getcwd(), root);
       const rel = pm.relative(resolvedRoot, resolved);
       if (!rel.startsWith('..') && !pm.isAbsolute(rel)) return true;
@@ -115,11 +140,11 @@ export class AcpKaos implements Kaos {
    * to local filesystem reads.
    */
   withCwd(cwd: string): Kaos {
-    return new AcpKaos(this.conn, this.sessionId, this.inner.withCwd(cwd), this.workspaceRoots);
+    return new AcpKaos(this.conn, this.sessionId, this.inner.withCwd(cwd), this.workspaceRoots, this.homeRoot);
   }
 
   withEnv(env: Record<string, string>): Kaos {
-    return new AcpKaos(this.conn, this.sessionId, this.inner.withEnv(env), this.workspaceRoots);
+    return new AcpKaos(this.conn, this.sessionId, this.inner.withEnv(env), this.workspaceRoots, this.homeRoot);
   }
 
   stat(path: string, options?: { followSymlinks?: boolean }): Promise<StatResult> {
@@ -155,6 +180,9 @@ export class AcpKaos implements Kaos {
     path: string,
     _options?: { encoding?: BufferEncoding; errors?: 'strict' | 'replace' | 'ignore' },
   ): Promise<string> {
+    if (this.shouldRouteToLocal(path)) {
+      return this.inner.readText(path, _options);
+    }
     const rpcPath = this.toClientPath(path);
     try {
       const resp = await this.conn.readTextFile({ sessionId: this.sessionId, path: rpcPath });
@@ -231,7 +259,7 @@ export class AcpKaos implements Kaos {
   ): Promise<number> {
     // Session-internal paths (e.g. ~/.kimi-code/sessionXXX/plan.md) are
     // outside the ACP client's workspace boundary — route through local FS.
-    if (!this.isWithinWorkspaceRoots(path)) {
+    if (this.shouldRouteToLocal(path)) {
       return this.inner.writeText(path, data, options);
     }
     if (options?.mode === 'a') {
@@ -255,7 +283,7 @@ export class AcpKaos implements Kaos {
    * (Read/Write/Edit tools), not binary streaming.
    */
   async writeBytes(path: string, data: Buffer): Promise<number> {
-    if (!this.isWithinWorkspaceRoots(path)) {
+    if (this.shouldRouteToLocal(path)) {
       return this.inner.writeBytes(path, data);
     }
     await this.acpWrite(path, data.toString('utf8'));

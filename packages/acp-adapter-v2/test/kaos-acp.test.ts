@@ -548,3 +548,140 @@ describe('AcpKaos', () => {
     });
   });
 });
+
+describe('home-root fallback', () => {
+  it('routes reads inside homeRoot through the local inner Kaos', async () => {
+    const conn = makeMockConn({ readHandler: async () => ({ content: 'ACP' }) });
+    const inner = makeMockInner();
+    const kaos = new AcpKaos(
+      conn.asConn(),
+      's1',
+      inner,
+      ['/workspace'],
+      '/home/user/.kimi-code',
+    );
+
+    const text = await kaos.readText('/home/user/.kimi-code/sessions/ws/s1/plans/x.md');
+
+    expect(text).toBe('INNER');
+    expect(inner.__spy.readTextCalls).toEqual([
+      '/home/user/.kimi-code/sessions/ws/s1/plans/x.md',
+    ]);
+    expect(conn.readCalls).toEqual([]);
+  });
+
+  it('keeps reads inside workspaceRoots on the ACP bridge even when homeRoot is set', async () => {
+    const conn = makeMockConn({ readHandler: async () => ({ content: 'ACP' }) });
+    const inner = makeMockInner();
+    const kaos = new AcpKaos(
+      conn.asConn(),
+      's1',
+      inner,
+      ['/workspace'],
+      '/home/user/.kimi-code',
+    );
+
+    const text = await kaos.readText('/workspace/src/main.ts');
+
+    expect(text).toBe('ACP');
+    expect(conn.readCalls).toEqual([{ sessionId: 's1', path: '/workspace/src/main.ts' }]);
+    expect(inner.__spy.readTextCalls).toEqual([]);
+  });
+
+  it('keeps reads outside both roots on the ACP bridge', async () => {
+    const conn = makeMockConn({ readHandler: async () => ({ content: 'ACP' }) });
+    const inner = makeMockInner();
+    const kaos = new AcpKaos(
+      conn.asConn(),
+      's1',
+      inner,
+      ['/workspace'],
+      '/home/user/.kimi-code',
+    );
+
+    const text = await kaos.readText('/home/user/.bashrc');
+
+    expect(text).toBe('ACP');
+    expect(conn.readCalls).toEqual([{ sessionId: 's1', path: '/home/user/.bashrc' }]);
+    expect(inner.__spy.readTextCalls).toEqual([]);
+  });
+
+  it('does not match a homeRoot sibling via string prefix', async () => {
+    const conn = makeMockConn({ readHandler: async () => ({ content: 'ACP' }) });
+    const inner = makeMockInner();
+    const kaos = new AcpKaos(
+      conn.asConn(),
+      's1',
+      inner,
+      ['/workspace'],
+      '/home/user/.kimi-code',
+    );
+
+    const text = await kaos.readText('/home/user/.kimi-codeX/plans/x.md');
+
+    expect(text).toBe('ACP');
+    expect(conn.readCalls).toEqual([
+      { sessionId: 's1', path: '/home/user/.kimi-codeX/plans/x.md' },
+    ]);
+    expect(inner.__spy.readTextCalls).toEqual([]);
+  });
+
+  it('routes writes inside homeRoot through the local inner Kaos', async () => {
+    const conn = makeMockConn({});
+    const inner = makeMockInner();
+    const kaos = new AcpKaos(
+      conn.asConn(),
+      's1',
+      inner,
+      ['/workspace'],
+      '/home/user/.kimi-code',
+    );
+
+    const n = await kaos.writeText('/home/user/.kimi-code/sessions/ws/s1/plans/x.md', 'plan');
+
+    expect(n).toBe(4);
+    expect(inner.__spy.writeTextCalls).toEqual([
+      { path: '/home/user/.kimi-code/sessions/ws/s1/plans/x.md', data: 'plan' },
+    ]);
+    expect(conn.writeCalls).toEqual([]);
+  });
+
+  it('routes writeBytes inside homeRoot through the local inner Kaos', async () => {
+    const conn = makeMockConn({});
+    const inner = makeMockInner();
+    const kaos = new AcpKaos(
+      conn.asConn(),
+      's1',
+      inner,
+      ['/workspace'],
+      '/home/user/.kimi-code',
+    );
+
+    const n = await kaos.writeBytes('/home/user/.kimi-code/logs/x.log', Buffer.from('hi'));
+
+    // The mock inner's writeBytes returns 0; the important assertions are that
+    // nothing crossed the ACP wire and writeText was not used.
+    expect(n).toBe(0);
+    expect(inner.__spy.writeTextCalls).toEqual([]);
+    expect(conn.writeCalls).toEqual([]);
+  });
+
+  it('keeps writes outside both roots on the ACP bridge (no wide local fallback)', async () => {
+    const conn = makeMockConn({});
+    const inner = makeMockInner();
+    const kaos = new AcpKaos(
+      conn.asConn(),
+      's1',
+      inner,
+      ['/workspace'],
+      '/home/user/.kimi-code',
+    );
+
+    await kaos.writeText('/home/user/.bashrc', 'alias ll=ls');
+
+    expect(conn.writeCalls).toEqual([
+      { sessionId: 's1', path: '/home/user/.bashrc', content: 'alias ll=ls' },
+    ]);
+    expect(inner.__spy.writeTextCalls).toEqual([]);
+  });
+});

@@ -652,7 +652,7 @@ export class AcpServer implements Agent {
       return undefined;
     }
     const innerKaos = await this.ensureInnerKaos();
-    return new AcpKaos(this.conn, sessionId, innerKaos, workspaceRoots);
+    return new AcpKaos(this.conn, sessionId, innerKaos, workspaceRoots, this.harness.homeDir);
   }
 
   private async ensureInnerKaos(): Promise<Kaos> {
@@ -1238,7 +1238,7 @@ function sessionSummaryToSessionInfo(summary: SessionSummary): SessionInfo {
  *  - `null` or non-array → `invalid_params` ("must be an array").
  *  - Each entry must be a non-empty absolute path string.
  *
- * Ported from the reference implementation at `E:/project/git/1/kimi-code`
+ * Ported from the reference implementation
  * (branch `feat/multi_root_workspace_support`).
  */
 export function validateAdditionalDirectories(dirs: unknown): string[] | undefined {
