@@ -545,6 +545,25 @@ importers:
         specifier: ^1.6.1
         version: 1.6.1
 
+  packages/acp-adapter-v2:
+    dependencies:
+      '@agentclientprotocol/sdk':
+        specifier: ^0.23.0
+        version: 0.23.0(zod@4.3.6)
+      '@moonshot-ai/agent-core-v2':
+        specifier: workspace:^
+        version: link:../agent-core-v2
+      '@moonshot-ai/kaos':
+        specifier: workspace:^
+        version: link:../kaos
+      '@moonshot-ai/kimi-code-sdk':
+        specifier: workspace:^
+        version: link:../node-sdk
+    devDependencies:
+      jimp:
+        specifier: ^1.6.1
+        version: 1.6.1
+
   packages/agent-core:
     dependencies:
       '@antfu/utils':
