@@ -89,6 +89,26 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     const ids = chunks.map((u) => (u as { messageId?: unknown }).messageId);
     expect(ids[0]).toBeTypeOf('string');
     expect(ids[1]).toBe(ids[0]);
+    const firstTurnMessageId = ids[0];
+
+    // A second sequential turn must mint a FRESH messageId: a change in
+    // messageId is how the client tells messages apart, so reusing the
+    // previous turn's id would merge two answers into one message.
+    scripted!.mockNextResponse({ type: 'text', text: 'Second turn.' });
+    const secondResult = (await c.send('session/prompt', {
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'another turn' }],
+    })) as { stopReason: string };
+    expect(secondResult.stopReason).toBe('end_turn');
+
+    const secondChunks = c
+      .sessionUpdates()
+      .slice()
+      .map((m) => (m.params as { update?: Update }).update)
+      .filter((u) => u?.sessionUpdate === 'agent_message_chunk');
+    const secondIds = secondChunks.map((u) => (u as { messageId?: unknown }).messageId);
+    expect(secondIds[secondIds.length - 1]).toBeTypeOf('string');
+    expect(secondIds[secondIds.length - 1]).not.toBe(firstTurnMessageId);
   }, 30_000);
 
   it('drives initialize → new → prompt and streams the assistant text as agent_message_chunk', async () => {
