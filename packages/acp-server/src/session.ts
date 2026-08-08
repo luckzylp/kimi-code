@@ -95,6 +95,8 @@ function leadingText(blocks: readonly ContentBlock[]): string | undefined {
   return undefined;
 }
 
+import { randomUUID } from 'node:crypto';
+
 /**
  * The engine's wire code for "another turn is active". A plain
  * `agent.prompt` while busy is QUEUED by the engine (the RPC returns
@@ -102,6 +104,34 @@ function leadingText(blocks: readonly ContentBlock[]): string | undefined {
  * only reaches us from `agent.activateSkill`, which rejects instead.
  */
 const TURN_AGENT_BUSY_CODE = 'turn.agent_busy';
+
+/**
+ * Coalescing policy for consecutive `assistant.delta` events. ACP's
+ * `agent_message_chunk` is an append-only notification, so forwarding
+ * every delta separately forces the client to re-parse the message's
+ * markdown on every fragment — shredding tables, lists, and code fences
+ * into half-rendered paragraphs. Instead, buffer the deltas and flush
+ * them as one chunk per sentence / per {@link MIN_ASSISTANT_CHUNK_CHARS}-
+ * size / per {@link ASSISTANT_CHUNK_MAX_AGE_MS}-age, so each wire chunk
+ * carries a readable, paragraph-scale amount of text.
+ */
+const MIN_ASSISTANT_CHUNK_CHARS = 20;
+
+/**
+ * Liveness safety net for the message buffer: if a turn emits text that
+ * never reaches {@link MIN_ASSISTANT_CHUNK_CHARS} nor a sentence boundary
+ * (e.g. the provider stalls mid-sentence), flush anyway after this long so
+ * the client still sees progress before the turn ends.
+ */
+const ASSISTANT_CHUNK_MAX_AGE_MS = 500;
+
+/**
+ * Characters that end a flushable text fragment. A buffered run ending in
+ * one of these is a natural ACP chunk boundary: the client can apply it
+ * without mid-sentence re-flow. Sentence punctuation plus the newline
+ * (code fences / list items land line-by-line, never word-by-word).
+ */
+const ASSISTANT_CHUNK_BOUNDARY_CHARS = new Set(['.', '。', '!', '！', '?', '？', '\n']);
 
 /**
  * Map a prompt-launch rejection (from `agent.prompt` / `agent.activateSkill`)
@@ -194,6 +224,18 @@ export class AcpSession {
   private skills: readonly SkillSummary[] = [];
   /** The in-flight prompt's driver, if any. */
   private driver: TurnDriver | undefined;
+  /**
+   * Coalescing buffer for `assistant.delta` tokens. `assistant.delta`
+   * deltas accumulate here; `pumpAssistantText` decides when they warrant a
+   * wire `agent_message_chunk` (sentence-sized, never token-sized — see
+   * `MIN_ASSISTANT_CHUNK_CHARS` for the why), and `flushAssistantTextNow`
+   * is the `turn.ended` counterpart that forces the final buffer out. Every
+   * chunk of a turn shares `messageId` so the client can group buffers into
+   * one streamed message.
+   */
+  private pendingAssistantText = '';
+  private pendingMessageId: string | undefined;
+  private assistantFlushTimer: ReturnType<typeof setTimeout> | undefined;
   /**
    * Abort markers of prompts still in their pre-turn image-compression phase
    * (no turn launched yet, so `agent.cancel` has nothing to cancel).
@@ -736,12 +778,25 @@ export class AcpSession {
 
   private onAssistantDelta(event: AgentEventPayloads['assistant.delta']): void {
     if (this.driverFor(event.turnId) === undefined) return;
-    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event));
+    // Accumulate the delta into the coalescing buffer instead of pushing
+    // one `agent_message_chunk` per event: ACP chunks are append-only, and
+    // forwarding 1-2 token deltas individually makes clients like Zed
+    // re-parse the message's markdown on every fragment, shredding
+    // tables/lists/code fences. The pump flushes at sentence /
+    // minimum-size / liveness-age boundaries (see
+    // `MIN_ASSISTANT_CHUNK_CHARS`), keeping the stream pumping while still
+    // pushing paragraph-scale chunks.
+    this.pendingAssistantText += event.delta;
+    this.pumpAssistantText();
   }
 
   private onThinkingDelta(event: AgentEventPayloads['thinking.delta']): void {
     if (this.driverFor(event.turnId) === undefined) return;
-    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event));
+    // Skip empty deltas: a blank `agent_thought_chunk` (text `""`) is not
+    // a thinking update and misleads clients into rendering phantom
+    // paragraphs. Only non-empty thinking reaches the wire.
+    if (event.delta.trim().length === 0) return;
+    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event, this.pendingMessageId));
   }
 
   private onToolCallStarted(event: AgentEventPayloads['tool.call.started']): void {
@@ -904,9 +959,84 @@ export class AcpSession {
     });
   }
 
+  /** Lazily mint the messageId shared by every chunk of the current message. */
+  private ensureMessageId(): string {
+    return (this.pendingMessageId ??= randomUUID());
+  }
+
+  /** Push one buffered text run as a single `agent_message_chunk`. */
+  private sendAssistantText(text: string): void {
+    this.emit({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text },
+        messageId: this.ensureMessageId(),
+      },
+    });
+  }
+
+  /**
+   * Flush the pending assistant buffer. Clears the liveness timer (it is
+   * one-shot per armed age window) and drops empty buffers. A flush marks
+   * the end of one streamed message — see `flushAssistantTextNow` for the
+   * messageId rotation that accompanies a terminal flush.
+   */
+  private flushAssistantText(): void {
+    if (this.assistantFlushTimer !== undefined) {
+      clearTimeout(this.assistantFlushTimer);
+      this.assistantFlushTimer = undefined;
+    }
+    if (this.pendingAssistantText.length === 0) return;
+    const text = this.pendingAssistantText;
+    this.pendingAssistantText = '';
+    this.sendAssistantText(text);
+  }
+
+  /**
+   * Decide whether the accumulated assistant text warrants a flush now:
+   * flush at sentence / minimum-size / liveness-age boundaries, exactly as
+   * {@link onAssistantDelta} describes. A one-shot liveness timer arms
+   * only when the buffer is growing too slowly to flush on its own.
+   */
+  private pumpAssistantText(): void {
+    const text = this.pendingAssistantText;
+    if (text.length === 0) return;
+    const lastChar = text.at(-1);
+    if (
+      text.length >= MIN_ASSISTANT_CHUNK_CHARS ||
+      (lastChar !== undefined && ASSISTANT_CHUNK_BOUNDARY_CHARS.has(lastChar))
+    ) {
+      this.flushAssistantText();
+      return;
+    }
+    // So far the buffer is neither big enough nor at a sentence boundary.
+    // Arm a one-shot liveness flush so a slow turn that stalls mid-sentence
+    // still shows progress before `turn.ended` forces the final flush.
+    this.assistantFlushTimer ??= setTimeout(() => {
+      this.assistantFlushTimer = undefined;
+      this.flushAssistantText();
+    }, ASSISTANT_CHUNK_MAX_AGE_MS);
+  }
+
+  /**
+   * Terminal flush: force the pending buffer out, then rotate `messageId`
+   * so the next message begins with a fresh id (a change in messageId
+   * signals a new message to the client). Called at `turn.ended`.
+   */
+  private flushAssistantTextNow(): void {
+    this.flushAssistantText();
+    this.pendingMessageId = undefined;
+  }
+
   private onTurnEnded(event: AgentEventPayloads['turn.ended']): void {
     const driver = this.driverFor(event.turnId);
     if (driver === undefined) return;
+    // Flush any pending assistant text BEFORE settling so the final chunk
+    // lands on the wire before the prompt's end_turn resolves (the client
+    // treats a messageId change as end-of-message, so a lingering buffer
+    // would otherwise arrive after `end_turn`).
+    this.flushAssistantTextNow();
     const error = event.error as { readonly code: string; readonly message?: string } | undefined;
     this.settleDriver(driver, () => {
       // Auth failures must surface as a JSON-RPC `auth_required` error

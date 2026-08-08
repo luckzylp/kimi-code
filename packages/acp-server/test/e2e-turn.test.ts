@@ -53,6 +53,44 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     return client;
   }
 
+  it('coalesces per-part assistant deltas into sentence-sized chunks sharing one messageId', async () => {
+    const c = await boot();
+    // Three text parts arrive as three separate `assistant.delta` events
+    // (the loop publishes one delta per streamed text part). The adapter
+    // must coalesce them into chunk runs: the first part ends at a sentence
+    // boundary ('.'), so it becomes its own chunk; the following two parts
+    // accumulate and flush on the trailing boundary of the last one. All
+    // chunks of the turn share one `messageId`.
+    scripted!.mockNextResponse({ type: 'text', text: 'Hello, world.' }, { type: 'text', text: ' Second sentence.' });
+
+    const created = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
+      sessionId: string;
+    };
+    await c.waitForSessionUpdate('available_commands_update', 10_000);
+
+    const promptPromise = c.send('session/prompt', {
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'write prose' }],
+    });
+
+    const result = (await promptPromise) as { stopReason: string };
+    expect(result.stopReason).toBe('end_turn');
+
+    type Update = { sessionUpdate?: string; content?: { text?: string } };
+    const chunks = c
+      .sessionUpdates()
+      .map((m) => (m.params as { update?: Update }).update)
+      .filter((u) => u?.sessionUpdate === 'agent_message_chunk');
+
+    expect(chunks.length).toBe(2);
+    const concatenated = chunks.map((u) => u?.content?.text).join('');
+    expect(concatenated).toBe('Hello, world. Second sentence.');
+    // Every chunk of the turn shares one non-empty messageId.
+    const ids = chunks.map((u) => (u as { messageId?: unknown }).messageId);
+    expect(ids[0]).toBeTypeOf('string');
+    expect(ids[1]).toBe(ids[0]);
+  }, 30_000);
+
   it('drives initialize → new → prompt and streams the assistant text as agent_message_chunk', async () => {
     const c = await boot();
     scripted!.mockNextText('hello from the scripted model');
