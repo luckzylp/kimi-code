@@ -424,6 +424,13 @@ export class AcpSession {
    */
   dispose(): void {
     this.cancel();
+    // Cancel the coalescing liveness timer so a pending flush never fires
+    // after teardown (the best-effort `emit` catch would swallow the error,
+    // but a post-dispose notification is still a leak).
+    if (this.assistantFlushTimer !== undefined) {
+      clearTimeout(this.assistantFlushTimer);
+      this.assistantFlushTimer = undefined;
+    }
     const driver = this.driver;
     if (driver !== undefined) {
       // Never leave the JSON-RPC `session/prompt` hanging after teardown.
@@ -948,13 +955,19 @@ export class AcpSession {
     this.emitLocalChunk(formatCompactionCompleted(event.result));
   }
 
-  /** Push one local `agent_message_chunk` (best-effort, never throws). */
+  /**
+   * Push one local `agent_message_chunk` (best-effort, never throws).
+   * Local chunks (compaction notices etc.) are standalone messages, not
+   * part of the streamed assistant turn — so they get their own fresh
+   * `messageId` rather than reusing the turn's pending id.
+   */
   private emitLocalChunk(text: string): void {
     this.emit({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text },
+        messageId: randomUUID(),
       },
     });
   }

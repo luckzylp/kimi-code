@@ -156,8 +156,12 @@ export class AcpHostFileSystem implements IHostFileSystem {
   /**
    * Bridge byte writes only when the payload is valid UTF-8. Binary data stays
    * on the local backend rather than being silently replaced with U+FFFD.
+   * Home-dir paths always go local (see {@link shouldServeLocally}).
    */
   async writeBytes(path: string, data: Uint8Array): Promise<void> {
+    if (this.shouldServeLocally(path)) {
+      return this.inner.writeBytes(path, data);
+    }
     if (!this.connection.fsWriteTextFile) {
       return this.inner.writeBytes(path, data);
     }
