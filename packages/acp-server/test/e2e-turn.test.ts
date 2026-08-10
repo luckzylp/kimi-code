@@ -122,6 +122,10 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     // Drain the post-new available_commands_update so prompt assertions only
     // see turn traffic.
     await c.waitForSessionUpdate('available_commands_update', 10_000);
+    // Drain the initial usage_update (a fresh session reports 0 used) so the
+    // turn-end assertion below resolves with the post-turn one, not the
+    // stale session/new notification.
+    await c.drainSessionUpdate('usage_update', 10_000);
 
     const promptPromise = c.send('session/prompt', {
       sessionId: created.sessionId,

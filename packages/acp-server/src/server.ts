@@ -285,6 +285,7 @@ export class AcpServer {
     // `resumeSession`, which deliberately skips replay per the ACP spec.
     await acpSession.replayHistory();
     this.scheduleAvailableCommandsUpdate(acpSession);
+    this.scheduleUsageUpdate(acpSession);
     return { configOptions: await acpSession.configOptions(), modes: acpSession.modeState() };
   }
 
@@ -296,6 +297,7 @@ export class AcpServer {
       acpMcpServersToConfigRecord(params.mcpServers),
     );
     this.scheduleAvailableCommandsUpdate(acpSession);
+    this.scheduleUsageUpdate(acpSession);
     return { configOptions: await acpSession.configOptions(), modes: acpSession.modeState() };
   }
 
@@ -565,6 +567,7 @@ export class AcpServer {
     const acpSession = await this.wireSession(sessionId);
     this.sessions.set(sessionId, acpSession);
     this.scheduleAvailableCommandsUpdate(acpSession);
+    this.scheduleUsageUpdate(acpSession);
     return { configOptions: await acpSession.configOptions(), modes: acpSession.modeState() };
   }
 
@@ -579,6 +582,19 @@ export class AcpServer {
   private scheduleAvailableCommandsUpdate(acpSession: AcpSession): void {
     setTimeout(() => {
       void acpSession.emitAvailableCommandsUpdate();
+    }, 0);
+  }
+
+  /**
+   * Push the `usage_update` AFTER the response
+   * (`session/new` / `/fork` / `/load` / `/resume`) has settled, for the
+   * same reason as `scheduleAvailableCommandsUpdate`: Zed silently drops
+   * `session/update` notifications that arrive before the client registers
+   * the session id.
+   */
+  private scheduleUsageUpdate(acpSession: AcpSession): void {
+    setTimeout(() => {
+      void acpSession.emitUsageUpdate();
     }, 0);
   }
 
