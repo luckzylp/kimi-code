@@ -953,6 +953,9 @@ export class AcpSession {
   /** Report the compaction result (token/message summary). */
   private onCompactionCompleted(event: AgentEventPayloads['compaction.completed']): void {
     this.emitLocalChunk(formatCompactionCompleted(event.result));
+    // Compaction dropped the context token count visibly — re-report usage
+    // so the client's context-size indicator reflects the fresh window.
+    void this.emitUsageUpdate();
   }
 
   /**
@@ -1064,13 +1067,15 @@ export class AcpSession {
   }
 
   /**
-   * Push a one-shot `usage_update` after a turn settles: `used` = the agent's
-   * current context token count, `size` = the bound model's max context size
-   * from the catalog. Skipped while no catalog model matches the bound id —
-   * there is nothing honest to report. `cost` stays omitted (the engine has
-   * no cost data).
+   * Push a one-shot `usage_update`: `used` = the agent's current context
+   * token count, `size` = the bound model's max context size from the
+   * catalog. Called after session setup (new / load / resume / fork), after a
+   * turn settles, on model switch, and after compaction — any point the
+   * client's context-size indicator should refresh. Skipped while no catalog
+   * model matches the bound id — there is nothing honest to report. `cost`
+   * stays omitted (the engine has no cost data).
    */
-  private async emitUsageUpdate(): Promise<void> {
+  async emitUsageUpdate(): Promise<void> {
     try {
       const size = (await this.klient.global.kosong.listModels()).find(
         (item) => item.model === this.currentModelId,
@@ -1203,6 +1208,9 @@ export class AcpSession {
       this.currentThinkingLevel = level;
     }
     await this.emitConfigOptionUpdate();
+    // A model switch can change the effective context window size. Re-report
+    // usage so the client's context indicator tracks the new limit.
+    void this.emitUsageUpdate();
   }
 
   /**
