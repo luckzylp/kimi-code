@@ -178,7 +178,7 @@ function escapeXmlAttr(s: string): string {
     .replace(/'/g, '&apos;');
 }
 
-function fileLinkToTextRef(uri: string): string | null {
+export function fileLinkToTextRef(uri: string): string | null {
   let url: URL;
   try {
     url = new URL(uri);

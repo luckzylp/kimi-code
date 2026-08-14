@@ -39,7 +39,7 @@ import {
 } from './builtin-commands';
 import { buildSessionConfigOptions } from './config-options';
 import { listModelsFromHarness } from './model-catalog';
-import { acpBlocksToPromptParts, compressPromptImageParts } from './convert';
+import { acpBlocksToPromptParts, compressPromptImageParts, fileLinkToTextRef } from './convert';
 import {
   acpToolCallId,
   assistantDeltaToSessionUpdate,
@@ -1570,12 +1570,13 @@ function formatContextUsage(contextUsage: number): string {
 }
 
 /**
- * Inspect the leading `ContentBlock` of an ACP prompt for a
- * `/skill:<name>` form. Only the first block is examined — when Zed
- * (or any other ACP client) sends a slash command, it always lives in
- * the first text block; multi-part prompts that interleave images or
- * resources before text are typed by humans and do not start with a
- * slash. Non-text leading blocks short-circuit to passthrough.
+ * Inspect the leading `ContentBlock`s of an ACP prompt for a
+ * `/skill:<name>` form. The whole prompt is reassembled — text blocks plus
+ * interspersed `resource` / `resource_link` blocks projected as file refs —
+ * because Zed renders `@file` mentions as resource blocks, so a slash command
+ * whose args mention files arrives as `[text][resource][text][resource][text]`
+ * and only the reassembly preserves the argument text that follows a resource.
+ * Non-text leading blocks short-circuit to passthrough.
  *
  * The parsing/resolution itself is delegated to `./slash` —
  * deliberately duplicated from the TUI's
@@ -1589,7 +1590,25 @@ function detectLeadingSlashIntent(
 ): ReturnType<typeof detectSlashIntent> {
   const first = blocks[0];
   if (!first || first.type !== 'text') return { kind: 'passthrough' };
-  return detectSlashIntent(first.text, skillCommandMap);
+
+  let text = '';
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      text += block.text;
+      continue;
+    }
+    const uri =
+      block.type === 'resource_link'
+        ? block.uri
+        : block.type === 'resource'
+          ? block.resource.uri
+          : undefined;
+    if (uri === undefined) continue; // image / audio / media contribute no command text
+    const ref = fileLinkToTextRef(uri) ?? uri;
+    if (text.length > 0 && !text.endsWith(' ') && !text.endsWith('\n')) text += ' ';
+    text += ref;
+  }
+  return detectSlashIntent(text, skillCommandMap);
 }
 
 function mapPromptError(err: unknown, sessionId: string): RequestError {

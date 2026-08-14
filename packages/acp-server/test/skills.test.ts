@@ -198,6 +198,46 @@ describe('acp-server skills / available commands', () => {
     expect(history).not.toContain('/skill:acp-fixture');
   }, 30_000);
 
+  it('reconstructs skill args that span interleaved text and file-resource blocks', async () => {
+    // Zed encodes `/skill:acp-fixture 请在 @a.ts:62 前面 参考 @b.ts:59-108 添加...`
+    // as a multi-part prompt: text block, then resource blocks inline
+    // (text → resource → text → resource → text). Slash detection must
+    // reassemble the full argument stream — including the text that comes
+    // AFTER a resource — instead of only the leading text block (`请在`).
+    const c = await bootWithFixtureSkill();
+    scripted!.mockNextText('FIXTURE');
+    const sessionId = await newSession(c);
+
+    const promptPromise = c.send('session/prompt', {
+      sessionId,
+      prompt: [
+        { type: 'text', text: '/skill:acp-fixture 请在 ' },
+        {
+          type: 'resource',
+          resource: { uri: 'file:///tmp/a.ts#L62', text: '// a.ts' },
+        },
+        { type: 'text', text: ' 前面 参考 ' },
+        {
+          type: 'resource',
+          resource: { uri: 'file:///tmp/b.ts#L59-108', text: '// b.ts' },
+        },
+        { type: 'text', text: ' 添加灵敏度配置支持' },
+      ],
+    });
+
+    await c.waitForSessionUpdate('agent_message_chunk', 10_000);
+    const result = (await promptPromise) as { stopReason: string };
+    expect(result.stopReason).toBe('end_turn');
+    expect(scripted!.callCount()).toBe(1);
+
+    const history = JSON.stringify(scripted!.callHistory()[0]);
+    expect(history).toContain(
+      'ARGUMENTS: 请在 /tmp/a.ts:62 前面 参考 /tmp/b.ts:59-108 添加灵敏度配置支持',
+    );
+    // The trailing blocks after the file resources must not be dropped.
+    expect(history).not.toContain('ARGUMENTS: 请在</skill-loaded>');
+  }, 30_000);
+
   it('a builtin-source skill activates through its bare command name', async () => {
     const c = await bootWithFixtureSkill();
     scripted!.mockNextText('goal noted');

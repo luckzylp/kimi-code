@@ -185,6 +185,67 @@ describe('AcpSession slash routing', () => {
     expect(calls.activate).toEqual([{ name: 'foo', args: 'bar baz' }]);
   });
 
+  it('reconstructs the full args when file resources are interleaved with the slash text', async () => {
+    // Zed encodes `/skill:foo 请在 @a.ts 前面 参考 @b.ts 添加...` as a
+    // multi-part prompt: text + resource + text + resource + text. The
+    // slash detector must reassemble the whole argument stream instead of
+    // only the leading text block (`请在`).
+    const sessionId = 'sess-slash-res';
+    const { session, calls } = makeFakeSession(sessionId, [endedTurn(sessionId)]);
+    const harness = {
+      auth: { status: async () => AUTHED_STATUS },
+      createSession: async () => session,
+    } as unknown as KimiHarness;
+
+    const { agentStream, clientStream } = makeInMemoryStreamPair();
+    new AgentSideConnection(
+      (c) =>
+        new AcpServer(harness, c, {
+          slashCommands: async (s) => {
+            const skills = await s.listSkills();
+            const map = new Map<string, string>();
+            const commands = skills.map((sk) => {
+              const name = `skill:${sk.name}`;
+              map.set(name, sk.name);
+              return { name, description: sk.description };
+            });
+            return { commands, skillCommandMap: map };
+          },
+        }),
+      agentStream,
+    );
+    const collecting = new CollectingClient();
+    const client = new ClientSideConnection(() => collecting, clientStream);
+
+    await client.newSession({ cwd: '/tmp/x', mcpServers: [] });
+    await waitForAvailableCommands(collecting);
+
+    await client.prompt({
+      sessionId,
+      prompt: [
+        textBlock('/skill:foo 请在 '),
+        {
+          type: 'resource',
+          resource: { uri: 'file:///tmp/a.ts#L62', text: '// a.ts' },
+        } as ContentBlock,
+        textBlock(' 前面 参考 '),
+        {
+          type: 'resource',
+          resource: { uri: 'file:///tmp/b.ts#L59-108', text: '// b.ts' },
+        } as ContentBlock,
+        textBlock(' 添加灵敏度配置支持'),
+      ],
+    });
+
+    expect(calls.prompt).toBe(0);
+    expect(calls.activate).toEqual([
+      {
+        name: 'foo',
+        args: '请在 /tmp/a.ts:62 前面 参考 /tmp/b.ts:59-108 添加灵敏度配置支持',
+      },
+    ]);
+  });
+
   it('passes empty-string args as undefined to activateSkill', async () => {
     const sessionId = 'sess-slash-B';
     const { session, calls } = makeFakeSession(sessionId, [endedTurn(sessionId)]);
