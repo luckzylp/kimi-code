@@ -86,14 +86,7 @@ import { log } from './log';
 import { projectModelCatalog } from './model-catalog';
 import { ACP_MODES, type AcpModeId, acpModeToToggles, DEFAULT_MODE_ID } from './modes';
 import { projectHistoryToSessionUpdates } from './replay';
-import { buildAcpSkillSlashCommands, detectSlashIntent } from './slash';
-
-/** Leading text of the first text block, if any (used for slash detection). */
-function leadingText(blocks: readonly ContentBlock[]): string | undefined {
-  const first = blocks[0];
-  if (first !== undefined && first.type === 'text') return first.text;
-  return undefined;
-}
+import { buildAcpSkillSlashCommands, commandTextFromBlocks, detectSlashIntent } from './slash';
 
 import { randomUUID } from 'node:crypto';
 
@@ -532,8 +525,12 @@ export class AcpSession {
     // turn; skills activate through the engine (rendered skill prompt driven
     // as a normal turn); unknown slash commands are answered locally with an
     // "unknown command" notice (never sent to the model); non-slash input
-    // goes to the model as-is.
-    const text = leadingText(blocks);
+    // goes to the model as-is. `commandTextFromBlocks` reassembles the whole
+    // prompt (text + interspersed file resources) so a command whose args
+    // span multiple blocks — e.g. `/skill:x 请在 @a.ts 前面 参考 @b.ts 添加…`
+    // encoded by Zed as text/resource/text/resource/text — keeps its full
+    // argument text instead of truncating to the leading block.
+    const text = commandTextFromBlocks(blocks);
     if (text !== undefined) {
       const commands = this.resolveCommands();
       const intent = detectSlashIntent(text, commands.skillCommandMap);
