@@ -40,10 +40,12 @@ function makeConnection(
 function makeFileSystem(
   client: FakeClient,
   capabilities?: { read?: boolean; write?: boolean },
+  homeDir = join(tmpdir(), 'acp-fs-home-bootstrap'),
 ): AcpHostFileSystem {
   return new AcpHostFileSystem(
-    { sessionId: 'session-test' } as never,
+    { sessionId: 'session-test', cwd: process.cwd() } as never,
     makeConnection(client, capabilities),
+    { homeDir, platform: process.platform, cwd: process.cwd() } as never,
   );
 }
 
@@ -192,5 +194,42 @@ describe('AcpHostFileSystem', () => {
     });
 
     await expect(fs.writeText(join(tempDir, 'new.txt'), 'x')).rejects.toBe(failure);
+  });
+
+  it('serves home-dir writes locally without crossing to the client', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'acp-fs-home-'));
+    const fs = makeFileSystem(
+      {
+        readTextFile: async () => {
+          throw new Error('must not use client text read');
+        },
+        writeTextFile: async () => {
+          throw new Error('must not use client text write');
+        },
+      },
+      { read: true, write: true },
+      tempDir,
+    );
+
+    const path = join(tempDir, 'sessions', 'plans', 'plan.md');
+    await fs.mkdir(join(tempDir, 'sessions', 'plans'), { recursive: true });
+    await fs.writeText(path, 'plan body');
+    await fs.appendText(path, '\nmore');
+
+    expect(await readFile(path, 'utf8')).toBe('plan body\nmore');
+  });
+  it('keeps cross-home sibling paths on the client bridge', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'acp-fs-home-'));
+    const writes: string[] = [];
+    const fs = makeFileSystem(
+      { readTextFile: async () => ({ content: '' }), writeTextFile: async ({ content }) => writes.push(content) },
+      { read: true, write: true },
+      tempDir,
+    );
+
+    // `~/.kimi-codeX` must not match the `~/.kimi-code` boundary.
+    await fs.writeText(`${tempDir}X/buffer.txt`, 'client side');
+
+    expect(writes).toEqual(['client side']);
   });
 });
