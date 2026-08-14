@@ -27,16 +27,21 @@ import type { AcpStopReason } from './types';
 /**
  * Build an ACP `session/update` notification with an
  * `agent_message_chunk` payload from an `assistant.delta` event.
+ *
+ * The optional `messageId` (UUID) lets a client group consecutive chunks
+ * of one streamed message; a change in the id signals a new message.
  */
 export function assistantDeltaToSessionUpdate(
   sessionId: string,
   event: AssistantDeltaEvent,
+  messageId?: string | null,
 ): SessionNotification {
   return {
     sessionId,
     update: {
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text: event.delta },
+      messageId,
     },
   };
 }
@@ -348,16 +353,23 @@ export function toolProgressToSessionUpdate(
 
 /**
  * Map a `thinking.delta` event to an `agent_thought_chunk` notification.
+ *
+ * Mirrors `assistantDeltaToSessionUpdate` shape but uses the
+ * `'agent_thought_chunk'` variant. The optional `messageId` shares the
+ * caller's per-message id so thought and text chunks of one turn group
+ * under the same message.
  */
 export function thinkingDeltaToSessionUpdate(
   sessionId: string,
   event: ThinkingDeltaEvent,
+  messageId?: string | null,
 ): SessionNotification {
   return {
     sessionId,
     update: {
       sessionUpdate: 'agent_thought_chunk',
       content: { type: 'text', text: event.delta },
+      messageId,
     },
   };
 }
