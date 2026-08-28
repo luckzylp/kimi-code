@@ -548,6 +548,7 @@ export interface AgentStatusUpdatedEvent {
   readonly contextUsage?: number;
   readonly planMode?: boolean;
   readonly swarmMode?: boolean;
+  readonly towerMode?: boolean;
   readonly permission?: PermissionMode;
   readonly usage?: UsageStatus;
   readonly phase?: AgentPhase;
@@ -682,6 +683,17 @@ export interface WarningEvent {
   readonly code?: string;
 }
 
+/** A prompt-carried transcript attachment: a session-media reference or a typed file attachment. */
+export type TurnPromptAttachment =
+  | { readonly kind: 'image' | 'video' | 'audio'; readonly fileId: string }
+  | {
+      readonly kind: 'file';
+      readonly name: string;
+      readonly mediaType: string;
+      readonly size: number;
+      readonly path: string;
+    };
+
 export interface TurnStartedEvent {
   readonly type: 'turn.started';
   readonly turnId: number;
@@ -689,8 +701,8 @@ export interface TurnStartedEvent {
   readonly prompt?: string;
   /** The prompt record id when the turn was opened by a prompt submission. */
   readonly promptId?: string;
-  /** Session-media references carried by the prompt (transcript attachments). */
-  readonly promptAttachments?: readonly { kind: 'image' | 'video' | 'audio'; fileId: string }[];
+  /** Session-media references and file attachments carried by the prompt (transcript attachments). */
+  readonly promptAttachments?: readonly TurnPromptAttachment[];
 }
 
 export interface TurnEndedEvent {
@@ -1545,6 +1557,7 @@ export const agentStatusUpdatedEventSchema = z.object({
   contextUsage: z.number().optional(),
   planMode: z.boolean().optional(),
   swarmMode: z.boolean().optional(),
+  towerMode: z.boolean().optional(),
   permission: permissionModeSchema.optional(),
   usage: usageStatusSchema.optional(),
   phase: agentPhaseSchema.optional(),
@@ -1664,7 +1677,18 @@ export const turnStartedEventSchema = z.object({
   prompt: z.string().optional(),
   promptId: z.string().optional(),
   promptAttachments: z
-    .array(z.object({ kind: z.enum(['image', 'video', 'audio']), fileId: z.string() }))
+    .array(
+      z.union([
+        z.object({ kind: z.enum(['image', 'video', 'audio']), fileId: z.string() }),
+        z.object({
+          kind: z.literal('file'),
+          name: z.string(),
+          mediaType: z.string(),
+          size: z.number(),
+          path: z.string(),
+        }),
+      ]),
+    )
     .optional(),
 }) satisfies z.ZodType<TurnStartedEvent>;
 
