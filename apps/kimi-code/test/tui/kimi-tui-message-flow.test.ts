@@ -301,6 +301,7 @@ function makeHarness(session = makeSession(), overrides: Record<string, unknown>
     createSession: vi.fn(async () => session),
     resumeSession: vi.fn(async () => session),
     forkSession: vi.fn(async () => session),
+    reloadSession: vi.fn(async () => session),
     listSessions: vi.fn(async () => []),
     exportSession: vi.fn(async () => ({
       zipPath: '/tmp/fake-session.zip',
@@ -2113,11 +2114,15 @@ command = "vim"
     driver.handleUserInput('/reload');
 
     await vi.waitFor(() => {
-      expect(session.reloadSession).toHaveBeenCalledOnce();
+      expect(harness.reloadSession).toHaveBeenCalledWith({
+        id: session.id,
+        forcePluginSessionStartReminder: true,
+      });
     });
     await vi.waitFor(() => {
       expect(driver.state.appState.theme).toBe('light');
     });
+    expect(session.reloadSession).not.toHaveBeenCalled();
     expect(harness.track).toHaveBeenCalledWith('input_command', { command: 'reload' });
     const transcript = stripSgr(renderTranscript(driver));
     expect(transcript).toContain('hello before reload');
@@ -2613,6 +2618,9 @@ command = "vim"
     expect(driver.state.appState).toMatchObject({
       permissionMode: 'yolo',
     });
+    expect(stripSgr(renderTranscript(driver))).toContain(
+      'In this mode, Kimi Code can modify or delete files without your confirmation',
+    );
     expect(harness.track).toHaveBeenCalledWith('input_command', { command: 'ask-when-needed' });
     expect(harness.track).not.toHaveBeenCalledWith('yolo_toggle', expect.anything());
   });
@@ -2856,6 +2864,9 @@ command = "vim"
     expect(transcript).not.toContain('hello');
     expect(transcript).not.toContain('Cannot undo 10 prompts');
     expect(transcript).toContain('Never Ask mode: ON');
+    expect(transcript).toContain(
+      'In this mode, Kimi Code can modify or delete files without your confirmation',
+    );
     expect(driver.state.appState.permissionMode).toBe('auto');
   });
 
