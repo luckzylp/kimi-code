@@ -201,8 +201,9 @@ jobs:
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
               --title "$RELEASE_TAG" \
               --notes "ACP-patched native binaries for upstream v${VERSION} (linux/darwin/win32 x x64/arm64)." \
               --target "$GITHUB_SHA"
@@ -212,4 +213,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
-        run: gh release upload "$RELEASE_TAG" dist-native-release/* --clobber
+        run: gh release upload "$RELEASE_TAG" dist-native-release/* --repo "$GITHUB_REPOSITORY" --clobber
