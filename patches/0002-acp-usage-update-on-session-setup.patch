@@ -1,0 +1,147 @@
+diff --git a/packages/acp-server/src/server.ts b/packages/acp-server/src/server.ts
+index 2c2e1ffd2..7739b540d 100644
+--- a/packages/acp-server/src/server.ts
++++ b/packages/acp-server/src/server.ts
+@@ -307,6 +307,7 @@ export class AcpServer {
+     // `resumeSession`, which deliberately skips replay per the ACP spec.
+     await acpSession.replayHistory();
+     this.scheduleAvailableCommandsUpdate(acpSession);
++    this.scheduleUsageUpdate(acpSession);
+     return { configOptions: await acpSession.configOptions(), modes: acpSession.modeState() };
+   }
+ 
+@@ -318,6 +319,7 @@ export class AcpServer {
+       acpMcpServersToConfigRecord(params.mcpServers),
+     );
+     this.scheduleAvailableCommandsUpdate(acpSession);
++    this.scheduleUsageUpdate(acpSession);
+     return { configOptions: await acpSession.configOptions(), modes: acpSession.modeState() };
+   }
+ 
+@@ -590,6 +592,7 @@ export class AcpServer {
+     const acpSession = await this.wireSession(sessionId);
+     this.sessions.set(sessionId, acpSession);
+     this.scheduleAvailableCommandsUpdate(acpSession);
++    this.scheduleUsageUpdate(acpSession);
+     return { configOptions: await acpSession.configOptions(), modes: acpSession.modeState() };
+   }
+ 
+@@ -606,6 +609,19 @@ export class AcpServer {
+     }, 0);
+   }
+ 
++  /**
++   * Push the `usage_update` AFTER the response
++   * (`session/new` / `/fork` / `/load` / `/resume`) has settled, for the
++   * same reason as `scheduleAvailableCommandsUpdate`: Zed silently drops
++   * `session/update` notifications that arrive before the client registers
++   * the session id.
++   */
++  private scheduleUsageUpdate(acpSession: AcpSession): void {
++    setTimeout(() => {
++      void acpSession.emitUsageUpdate();
++    }, 0);
++  }
++
+   private async bindDefaultModel(agent: AgentHandle): Promise<void> {
+     try {
+       // `getModel` is '' while the profile has no model bound (the same guard
+diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/session.ts
+index 6d53c8293..c96dc9a56 100644
+--- a/packages/acp-server/src/session.ts
++++ b/packages/acp-server/src/session.ts
+@@ -982,6 +982,9 @@ export class AcpSession {
+   /** Report the compaction result (token/message summary). */
+   private onCompactionCompleted(event: AgentEventPayloads['compaction.completed']): void {
+     this.emitLocalChunk(formatCompactionCompleted(event.result));
++    // Compaction dropped the context token count visibly — re-report usage
++    // so the client's context-size indicator reflects the fresh window.
++    void this.emitUsageUpdate();
+   }
+ 
+   /**
+@@ -1093,13 +1096,15 @@ export class AcpSession {
+   }
+ 
+   /**
+-   * Push a one-shot `usage_update` after a turn settles: `used` = the agent's
+-   * current context token count, `size` = the bound model's max context size
+-   * from the catalog. Skipped while no catalog model matches the bound id —
+-   * there is nothing honest to report. `cost` stays omitted (the engine has
+-   * no cost data).
++   * Push a one-shot `usage_update`: `used` = the agent's current context
++   * token count, `size` = the bound model's max context size from the
++   * catalog. Called after session setup (new / load / resume / fork), after a
++   * turn settles, on model switch, and after compaction — any point the
++   * client's context-size indicator should refresh. Skipped while no catalog
++   * model matches the bound id — there is nothing honest to report. `cost`
++   * stays omitted (the engine has no cost data).
+    */
+-  private async emitUsageUpdate(): Promise<void> {
++  async emitUsageUpdate(): Promise<void> {
+     try {
+       const size = (await this.klient.global.kosong.listModels()).find(
+         (item) => item.model === this.currentModelId,
+@@ -1232,6 +1237,9 @@ export class AcpSession {
+       this.currentThinkingLevel = level;
+     }
+     await this.emitConfigOptionUpdate();
++    // A model switch can change the effective context window size. Re-report
++    // usage so the client's context indicator tracks the new limit.
++    void this.emitUsageUpdate();
+   }
+ 
+   /**
+diff --git a/packages/acp-server/test/_helpers/acpClient.ts b/packages/acp-server/test/_helpers/acpClient.ts
+index 3f4dd47f0..fe887ef16 100644
+--- a/packages/acp-server/test/_helpers/acpClient.ts
++++ b/packages/acp-server/test/_helpers/acpClient.ts
+@@ -26,6 +26,12 @@ export interface TestClient {
+   sessionUpdates(): readonly RpcMessage[];
+   /** Resolve once a `session/update` whose `update.sessionUpdate` matches arrives. */
+   waitForSessionUpdate(sessionUpdate: string, timeoutMs?: number): Promise<RpcMessage>;
++  /**
++   * Consume one `session/update` of the given kind from the received buffer
++   * so a later {@link waitForSessionUpdate} for the same kind does not
++   * re-resolve with the stale notification. Returns the consumed message.
++   */
++  drainSessionUpdate(sessionUpdate: string, timeoutMs?: number): Promise<RpcMessage>;
+   /**
+    * Register a handler for an agent-initiated request method (e.g.
+    * `session/request_permission`). The handler's return value is sent back as
+@@ -150,6 +156,13 @@ export async function createTestClient(opts: {
+     return received.filter((m) => m.method === 'session/update');
+   }
+ 
++  async function drainSessionUpdate(sessionUpdate: string, timeoutMs = 5_000): Promise<RpcMessage> {
++    const msg = await waitForSessionUpdate(sessionUpdate, timeoutMs);
++    const i = received.indexOf(msg);
++    if (i >= 0) received.splice(i, 1);
++    return msg;
++  }
++
+   function waitForSessionUpdate(sessionUpdate: string, timeoutMs = 5_000): Promise<RpcMessage> {
+     const existing = sessionUpdates().find((m) => {
+       const update = (m.params as { update?: { sessionUpdate?: string } } | undefined)?.update;
+@@ -180,5 +193,5 @@ export async function createTestClient(opts: {
+     requestHandlers.set(method, handler);
+   }
+ 
+-  return { send, notify, received, sessionUpdates, waitForSessionUpdate, onRequest, server, close };
++  return { send, notify, received, sessionUpdates, waitForSessionUpdate, drainSessionUpdate, onRequest, server, close };
+ }
+diff --git a/packages/acp-server/test/e2e-turn.test.ts b/packages/acp-server/test/e2e-turn.test.ts
+index 16f175c12..01a5ccbba 100644
+--- a/packages/acp-server/test/e2e-turn.test.ts
++++ b/packages/acp-server/test/e2e-turn.test.ts
+@@ -139,6 +139,10 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
+     // Drain the post-new available_commands_update so prompt assertions only
+     // see turn traffic.
+     await c.waitForSessionUpdate('available_commands_update', 10_000);
++    // Drain the initial usage_update (a fresh session reports 0 used) so the
++    // turn-end assertion below resolves with the post-turn one, not the
++    // stale session/new notification.
++    await c.drainSessionUpdate('usage_update', 10_000);
+ 
+     const promptPromise = c.send('session/prompt', {
+       sessionId: created.sessionId,

@@ -1,0 +1,528 @@
+diff --git a/packages/acp-server/src/acp-fs/acpFsService.ts b/packages/acp-server/src/acp-fs/acpFsService.ts
+index 3b1858f28..fd50581a8 100644
+--- a/packages/acp-server/src/acp-fs/acpFsService.ts
++++ b/packages/acp-server/src/acp-fs/acpFsService.ts
+@@ -5,6 +5,13 @@
+  * other operation (binary IO, stat/realpath/readdir/mkdir/remove, exclusive
+  * create) to a node-local inner backend.
+  *
++ * Paths inside the agent's own data directory (the bootstrap `homeDir`,
++ * e.g. `~/.kimi-code` — which holds session dirs and plan documents) are
++ * served by the local backend too: ACP clients only grant the workspace
++ * `cwd`, so a reverse-RPC to write `~/.kimi-code/sessionId/.../plan.md`
++ * would be rejected by the host. Session-internal files must never cross to
++ * the client, mirroring the legacy adapter's `homeRoot` local fallback.
++ *
+  * Registered at Session scope so it shadows the App-scope node-local
+  * `IHostFileSystem` for Session- and Agent-scope consumers (the os file tools),
+  * while App-scope consumers (persistence, skill loading, workspace registry)
+@@ -15,7 +22,7 @@
+  * connection.
+  */
+ 
+-import { dirname } from 'node:path';
++import { dirname, posix, win32 } from 'node:path';
+ 
+ import { RequestError } from '@agentclientprotocol/sdk';
+ import {
+@@ -31,6 +38,7 @@ import {
+   type HostFileStat,
+   type HostWalkOptions,
+   type HostWalkVisitor,
++  IBootstrapOptions,
+   IHostFileSystem,
+   ISessionContext,
+   LifecycleScope,
+@@ -74,9 +82,32 @@ export class AcpHostFileSystem implements IHostFileSystem {
+   constructor(
+     @ISessionContext private readonly ctx: ISessionContext,
+     @IAcpConnection private readonly connection: IAcpConnection,
++    @IBootstrapOptions private readonly bootstrap: IBootstrapOptions,
+   ) {}
+ 
++  /**
++   * True when `target` is inside the agent's own data directory (the
++   * resolved `~/.kimi-code` home). Uses the same path-boundary logic as the
++   * workspace roots so a sibling like `~/.kimi-codeX` does not match.
++   */
++  private isWithinHomeRoot(target: string): boolean {
++    const consumer = this.bootstrap.platform === 'win32' ? win32 : posix;
++    const resolved = consumer.isAbsolute(target)
++      ? target
++      : consumer.resolve(this.ctx.cwd, target);
++    const resolvedHome = consumer.resolve(this.bootstrap.homeDir);
++    const rel = consumer.relative(resolvedHome, resolved);
++    return !rel.startsWith('..') && !consumer.isAbsolute(rel);
++  }
++
++  private shouldServeLocally(path: string): boolean {
++    return this.isWithinHomeRoot(path);
++  }
++
+   async readText(path: string, options?: ReadTextOptions): Promise<string> {
++    if (this.shouldServeLocally(path)) {
++      return this.inner.readText(path, options);
++    }
+     if (!this.connection.fsReadTextFile) {
+       return this.inner.readText(path, options);
+     }
+@@ -94,6 +125,9 @@ export class AcpHostFileSystem implements IHostFileSystem {
+    * matching host fs error so callers can create the parent and retry.
+    */
+   async writeText(path: string, data: string): Promise<void> {
++    if (this.shouldServeLocally(path)) {
++      return this.inner.writeText(path, data);
++    }
+     if (!this.connection.fsWriteTextFile) {
+       return this.inner.writeText(path, data);
+     }
+@@ -123,6 +157,9 @@ export class AcpHostFileSystem implements IHostFileSystem {
+    * client file, while all other read failures are propagated.
+    */
+   async appendText(path: string, data: string): Promise<void> {
++    if (this.shouldServeLocally(path)) {
++      return this.inner.appendText(path, data);
++    }
+     if (!this.connection.fsReadTextFile || !this.connection.fsWriteTextFile) {
+       return this.inner.appendText(path, data);
+     }
+@@ -151,8 +188,12 @@ export class AcpHostFileSystem implements IHostFileSystem {
+   /**
+    * Bridge byte writes only when the payload is valid UTF-8. Binary data stays
+    * on the local backend rather than being silently replaced with U+FFFD.
++   * Home-dir paths always go local (see {@link shouldServeLocally}).
+    */
+   async writeBytes(path: string, data: Uint8Array): Promise<void> {
++    if (this.shouldServeLocally(path)) {
++      return this.inner.writeBytes(path, data);
++    }
+     if (!this.connection.fsWriteTextFile) {
+       return this.inner.writeBytes(path, data);
+     }
+diff --git a/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts b/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts
+index 1d69debe9..74908f72d 100644
+--- a/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts
++++ b/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts
+@@ -9,6 +9,7 @@ import type {
+   IHostFileSystem,
+   IHostProcess,
+   IHostProcessService,
++  IBootstrapOptions,
+   ISessionContext,
+   Environment,
+   EnvironmentPath,
+@@ -199,7 +200,14 @@ class AcpSessionEnvironment implements Environment {
+       basename: (p: string) => path.basename(p),
+       dirname: (p: string) => path.dirname(p),
+     };
+-    this.fs = new AcpHostFileSystem({ sessionId } as unknown as ISessionContext, connection);
++    this.fs = new AcpHostFileSystem(
++      { sessionId } as unknown as ISessionContext,
++      connection,
++      {
++        homeDir: environment.homeDir,
++        platform: environment.pathClass === 'win32' ? 'win32' : process.platform,
++      } as unknown as IBootstrapOptions,
++    );
+     this.process = new AcpProcessService(sessionId, cwd, connection, local);
+   }
+ 
+diff --git a/packages/acp-server/src/events-map.ts b/packages/acp-server/src/events-map.ts
+index 2b2c042f1..6e4b7445b 100644
+--- a/packages/acp-server/src/events-map.ts
++++ b/packages/acp-server/src/events-map.ts
+@@ -29,16 +29,21 @@ import type { AcpStopReason } from './types';
+ /**
+  * Build an ACP `session/update` notification with an
+  * `agent_message_chunk` payload from an `assistant.delta` event.
++ *
++ * The optional `messageId` (UUID) lets a client group consecutive chunks
++ * of one streamed message; a change in the id signals a new message.
+  */
+ export function assistantDeltaToSessionUpdate(
+   sessionId: string,
+   event: AssistantDeltaEvent,
++  messageId?: string | null,
+ ): SessionNotification {
+   return {
+     sessionId,
+     update: {
+       sessionUpdate: 'agent_message_chunk',
+       content: { type: 'text', text: event.delta },
++      messageId,
+     },
+   };
+ }
+@@ -350,16 +355,23 @@ export function toolProgressToSessionUpdate(
+ 
+ /**
+  * Map a `thinking.delta` event to an `agent_thought_chunk` notification.
++ *
++ * Mirrors `assistantDeltaToSessionUpdate` shape but uses the
++ * `'agent_thought_chunk'` variant. The optional `messageId` shares the
++ * caller's per-message id so thought and text chunks of one turn group
++ * under the same message.
+  */
+ export function thinkingDeltaToSessionUpdate(
+   sessionId: string,
+   event: ThinkingDeltaEvent,
++  messageId?: string | null,
+ ): SessionNotification {
+   return {
+     sessionId,
+     update: {
+       sessionUpdate: 'agent_thought_chunk',
+       content: { type: 'text', text: event.delta },
++      messageId,
+     },
+   };
+ }
+diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/session.ts
+index d6e528655..6d53c8293 100644
+--- a/packages/acp-server/src/session.ts
++++ b/packages/acp-server/src/session.ts
+@@ -20,6 +20,8 @@
+  *  - no `Turn.result` promise → settlement relies solely on `turn.ended`.
+  */
+ 
++import { randomUUID } from 'node:crypto';
++
+ import type {
+   AvailableCommand,
+   ContentBlock,
+@@ -64,7 +66,6 @@ import { buildSessionConfigOptions } from './config-options';
+ import { acpBlocksToContentParts, compressPromptImageParts } from './convert';
+ import {
+   acpToolCallId,
+-  assistantDeltaToSessionUpdate,
+   availableCommandsUpdateNotification,
+   configOptionUpdateNotification,
+   currentModeUpdateNotification,
+@@ -107,6 +108,34 @@ const TURN_AGENT_BUSY_CODE = 'turn.agent_busy';
+ const SESSION_OCCUPIED_CODE = 'session.occupied';
+ const SESSION_STALE_CODE = 'session.stale';
+ 
++/**
++ * Coalescing policy for consecutive `assistant.delta` events. ACP's
++ * `agent_message_chunk` is an append-only notification, so forwarding
++ * every delta separately forces the client to re-parse the message's
++ * markdown on every fragment — shredding tables, lists, and code fences
++ * into half-rendered paragraphs. Instead, buffer the deltas and flush
++ * them as one chunk per sentence / per {@link MIN_ASSISTANT_CHUNK_CHARS}-
++ * size / per {@link ASSISTANT_CHUNK_MAX_AGE_MS}-age, so each wire chunk
++ * carries a readable, paragraph-scale amount of text.
++ */
++const MIN_ASSISTANT_CHUNK_CHARS = 20;
++
++/**
++ * Liveness safety net for the message buffer: if a turn emits text that
++ * never reaches {@link MIN_ASSISTANT_CHUNK_CHARS} nor a sentence boundary
++ * (e.g. the provider stalls mid-sentence), flush anyway after this long so
++ * the client still sees progress before the turn ends.
++ */
++const ASSISTANT_CHUNK_MAX_AGE_MS = 500;
++
++/**
++ * Characters that end a flushable text fragment. A buffered run ending in
++ * one of these is a natural ACP chunk boundary: the client can apply it
++ * without mid-sentence re-flow. Sentence punctuation plus the newline
++ * (code fences / list items land line-by-line, never word-by-word).
++ */
++const ASSISTANT_CHUNK_BOUNDARY_CHARS = new Set(['.', '。', '!', '！', '?', '？', '\n']);
++
+ /**
+  * Map a prompt-launch rejection (from `agent.prompt` / `agent.activateSkill`)
+  * to the JSON-RPC error the client sees.
+@@ -213,6 +242,18 @@ export class AcpSession {
+   private skills: readonly SkillSummary[] = [];
+   /** The in-flight prompt's driver, if any. */
+   private driver: TurnDriver | undefined;
++  /**
++   * Coalescing buffer for `assistant.delta` tokens. `assistant.delta`
++   * deltas accumulate here; `pumpAssistantText` decides when they warrant a
++   * wire `agent_message_chunk` (sentence-sized, never token-sized — see
++   * `MIN_ASSISTANT_CHUNK_CHARS` for the why), and `flushAssistantTextNow`
++   * is the `turn.ended` counterpart that forces the final buffer out. Every
++   * chunk of a turn shares `messageId` so the client can group buffers into
++   * one streamed message.
++   */
++  private pendingAssistantText = '';
++  private pendingMessageId: string | undefined;
++  private assistantFlushTimer: ReturnType<typeof setTimeout> | undefined;
+   /**
+    * Abort markers of prompts still in their pre-turn image-compression phase
+    * (no turn launched yet, so `agent.cancel` has nothing to cancel).
+@@ -401,6 +442,13 @@ export class AcpSession {
+    */
+   dispose(): void {
+     this.cancel();
++    // Cancel the coalescing liveness timer so a pending flush never fires
++    // after teardown (the best-effort `emit` catch would swallow the error,
++    // but a post-dispose notification is still a leak).
++    if (this.assistantFlushTimer !== undefined) {
++      clearTimeout(this.assistantFlushTimer);
++      this.assistantFlushTimer = undefined;
++    }
+     const driver = this.driver;
+     if (driver !== undefined) {
+       // Never leave the JSON-RPC `session/prompt` hanging after teardown.
+@@ -766,12 +814,25 @@ export class AcpSession {
+ 
+   private onAssistantDelta(event: AgentEventPayloads['assistant.delta']): void {
+     if (this.driverFor(event.turnId) === undefined) return;
+-    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event));
++    // Accumulate the delta into the coalescing buffer instead of pushing
++    // one `agent_message_chunk` per event: ACP chunks are append-only, and
++    // forwarding 1-2 token deltas individually makes clients like Zed
++    // re-parse the message's markdown on every fragment, shredding
++    // tables/lists/code fences. The pump flushes at sentence /
++    // minimum-size / liveness-age boundaries (see
++    // `MIN_ASSISTANT_CHUNK_CHARS`), keeping the stream pumping while still
++    // pushing paragraph-scale chunks.
++    this.pendingAssistantText += event.delta;
++    this.pumpAssistantText();
+   }
+ 
+   private onThinkingDelta(event: AgentEventPayloads['thinking.delta']): void {
+     if (this.driverFor(event.turnId) === undefined) return;
+-    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event));
++    // Skip empty deltas: a blank `agent_thought_chunk` (text `""`) is not
++    // a thinking update and misleads clients into rendering phantom
++    // paragraphs. Only non-empty thinking reaches the wire.
++    if (event.delta.trim().length === 0) return;
++    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event, this.pendingMessageId));
+   }
+ 
+   private onToolCallStarted(event: AgentEventPayloads['tool.call.started']): void {
+@@ -923,20 +984,101 @@ export class AcpSession {
+     this.emitLocalChunk(formatCompactionCompleted(event.result));
+   }
+ 
+-  /** Push one local `agent_message_chunk` (best-effort, never throws). */
++  /**
++   * Push one local `agent_message_chunk` (best-effort, never throws).
++   * Local chunks (compaction notices etc.) are standalone messages, not
++   * part of the streamed assistant turn — so they get their own fresh
++   * `messageId` rather than reusing the turn's pending id.
++   */
+   private emitLocalChunk(text: string): void {
+     this.emit({
+       sessionId: this.sessionId,
+       update: {
+         sessionUpdate: 'agent_message_chunk',
+         content: { type: 'text', text },
++        messageId: randomUUID(),
+       },
+     });
+   }
+ 
++  /** Lazily mint the messageId shared by every chunk of the current message. */
++  private ensureMessageId(): string {
++    return (this.pendingMessageId ??= randomUUID());
++  }
++
++  /** Push one buffered text run as a single `agent_message_chunk`. */
++  private sendAssistantText(text: string): void {
++    this.emit({
++      sessionId: this.sessionId,
++      update: {
++        sessionUpdate: 'agent_message_chunk',
++        content: { type: 'text', text },
++        messageId: this.ensureMessageId(),
++      },
++    });
++  }
++
++  /**
++   * Flush the pending assistant buffer. Clears the liveness timer (it is
++   * one-shot per armed age window) and drops empty buffers. A flush marks
++   * the end of one streamed message — see `flushAssistantTextNow` for the
++   * messageId rotation that accompanies a terminal flush.
++   */
++  private flushAssistantText(): void {
++    if (this.assistantFlushTimer !== undefined) {
++      clearTimeout(this.assistantFlushTimer);
++      this.assistantFlushTimer = undefined;
++    }
++    if (this.pendingAssistantText.length === 0) return;
++    const text = this.pendingAssistantText;
++    this.pendingAssistantText = '';
++    this.sendAssistantText(text);
++  }
++
++  /**
++   * Decide whether the accumulated assistant text warrants a flush now:
++   * flush at sentence / minimum-size / liveness-age boundaries, exactly as
++   * {@link onAssistantDelta} describes. A one-shot liveness timer arms
++   * only when the buffer is growing too slowly to flush on its own.
++   */
++  private pumpAssistantText(): void {
++    const text = this.pendingAssistantText;
++    if (text.length === 0) return;
++    const lastChar = text.at(-1);
++    if (
++      text.length >= MIN_ASSISTANT_CHUNK_CHARS ||
++      (lastChar !== undefined && ASSISTANT_CHUNK_BOUNDARY_CHARS.has(lastChar))
++    ) {
++      this.flushAssistantText();
++      return;
++    }
++    // So far the buffer is neither big enough nor at a sentence boundary.
++    // Arm a one-shot liveness flush so a slow turn that stalls mid-sentence
++    // still shows progress before `turn.ended` forces the final flush.
++    this.assistantFlushTimer ??= setTimeout(() => {
++      this.assistantFlushTimer = undefined;
++      this.flushAssistantText();
++    }, ASSISTANT_CHUNK_MAX_AGE_MS);
++  }
++
++  /**
++   * Terminal flush: force the pending buffer out, then rotate `messageId`
++   * so the next message begins with a fresh id (a change in messageId
++   * signals a new message to the client). Called at `turn.ended`.
++   */
++  private flushAssistantTextNow(): void {
++    this.flushAssistantText();
++    this.pendingMessageId = undefined;
++  }
++
+   private onTurnEnded(event: AgentEventPayloads['turn.ended']): void {
+     const driver = this.driverFor(event.turnId);
+     if (driver === undefined) return;
++    // Flush any pending assistant text BEFORE settling so the final chunk
++    // lands on the wire before the prompt's end_turn resolves (the client
++    // treats a messageId change as end-of-message, so a lingering buffer
++    // would otherwise arrive after `end_turn`).
++    this.flushAssistantTextNow();
+     const error = event.error as { readonly code: string; readonly message?: string } | undefined;
+     this.settleDriver(driver, () => {
+       // Auth failures must surface as a JSON-RPC `auth_required` error
+diff --git a/packages/acp-server/test/acp-fs.test.ts b/packages/acp-server/test/acp-fs.test.ts
+index 7db8fbb81..2d8941db1 100644
+--- a/packages/acp-server/test/acp-fs.test.ts
++++ b/packages/acp-server/test/acp-fs.test.ts
+@@ -40,10 +40,12 @@ function makeConnection(
+ function makeFileSystem(
+   client: FakeClient,
+   capabilities?: { read?: boolean; write?: boolean },
++  homeDir = join(tmpdir(), 'acp-fs-home-bootstrap'),
+ ): AcpHostFileSystem {
+   return new AcpHostFileSystem(
+-    { sessionId: 'session-test' } as never,
++    { sessionId: 'session-test', cwd: process.cwd() } as never,
+     makeConnection(client, capabilities),
++    { homeDir, platform: process.platform, cwd: process.cwd() } as never,
+   );
+ }
+ 
+@@ -193,4 +195,41 @@ describe('AcpHostFileSystem', () => {
+ 
+     await expect(fs.writeText(join(tempDir, 'new.txt'), 'x')).rejects.toBe(failure);
+   });
++
++  it('serves home-dir writes locally without crossing to the client', async () => {
++    tempDir = await mkdtemp(join(tmpdir(), 'acp-fs-home-'));
++    const fs = makeFileSystem(
++      {
++        readTextFile: async () => {
++          throw new Error('must not use client text read');
++        },
++        writeTextFile: async () => {
++          throw new Error('must not use client text write');
++        },
++      },
++      { read: true, write: true },
++      tempDir,
++    );
++
++    const path = join(tempDir, 'sessions', 'plans', 'plan.md');
++    await fs.mkdir(join(tempDir, 'sessions', 'plans'), { recursive: true });
++    await fs.writeText(path, 'plan body');
++    await fs.appendText(path, '\nmore');
++
++    expect(await readFile(path, 'utf8')).toBe('plan body\nmore');
++  });
++  it('keeps cross-home sibling paths on the client bridge', async () => {
++    tempDir = await mkdtemp(join(tmpdir(), 'acp-fs-home-'));
++    const writes: string[] = [];
++    const fs = makeFileSystem(
++      { readTextFile: async () => ({ content: '' }), writeTextFile: async ({ content }) => writes.push(content) },
++      { read: true, write: true },
++      tempDir,
++    );
++
++    // `~/.kimi-codeX` must not match the `~/.kimi-code` boundary.
++    await fs.writeText(`${tempDir}X/buffer.txt`, 'client side');
++
++    expect(writes).toEqual(['client side']);
++  });
+ });
+diff --git a/packages/acp-server/test/e2e-turn.test.ts b/packages/acp-server/test/e2e-turn.test.ts
+index bebbe42cd..16f175c12 100644
+--- a/packages/acp-server/test/e2e-turn.test.ts
++++ b/packages/acp-server/test/e2e-turn.test.ts
+@@ -70,6 +70,64 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
+     return client;
+   }
+ 
++  it('coalesces per-part assistant deltas into sentence-sized chunks sharing one messageId', async () => {
++    const c = await boot();
++    // Three text parts arrive as three separate `assistant.delta` events
++    // (the loop publishes one delta per streamed text part). The adapter
++    // must coalesce them into chunk runs: the first part ends at a sentence
++    // boundary ('.'), so it becomes its own chunk; the following two parts
++    // accumulate and flush on the trailing boundary of the last one. All
++    // chunks of the turn share one `messageId`.
++    scripted!.mockNextResponse({ type: 'text', text: 'Hello, world.' }, { type: 'text', text: ' Second sentence.' });
++
++    const created = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
++      sessionId: string;
++    };
++    await c.waitForSessionUpdate('available_commands_update', 10_000);
++
++    const promptPromise = c.send('session/prompt', {
++      sessionId: created.sessionId,
++      prompt: [{ type: 'text', text: 'write prose' }],
++    });
++
++    const result = (await promptPromise) as { stopReason: string };
++    expect(result.stopReason).toBe('end_turn');
++
++    type Update = { sessionUpdate?: string; content?: { text?: string } };
++    const chunks = c
++      .sessionUpdates()
++      .map((m) => (m.params as { update?: Update }).update)
++      .filter((u) => u?.sessionUpdate === 'agent_message_chunk');
++
++    expect(chunks.length).toBe(2);
++    const concatenated = chunks.map((u) => u?.content?.text).join('');
++    expect(concatenated).toBe('Hello, world. Second sentence.');
++    // Every chunk of the turn shares one non-empty messageId.
++    const ids = chunks.map((u) => (u as { messageId?: unknown }).messageId);
++    expect(ids[0]).toBeTypeOf('string');
++    expect(ids[1]).toBe(ids[0]);
++    const firstTurnMessageId = ids[0];
++
++    // A second sequential turn must mint a FRESH messageId: a change in
++    // messageId is how the client tells messages apart, so reusing the
++    // previous turn's id would merge two answers into one message.
++    scripted!.mockNextResponse({ type: 'text', text: 'Second turn.' });
++    const secondResult = (await c.send('session/prompt', {
++      sessionId: created.sessionId,
++      prompt: [{ type: 'text', text: 'another turn' }],
++    })) as { stopReason: string };
++    expect(secondResult.stopReason).toBe('end_turn');
++
++    const secondChunks = c
++      .sessionUpdates()
++      .slice()
++      .map((m) => (m.params as { update?: Update }).update)
++      .filter((u) => u?.sessionUpdate === 'agent_message_chunk');
++    const secondIds = secondChunks.map((u) => (u as { messageId?: unknown }).messageId);
++    expect(secondIds[secondIds.length - 1]).toBeTypeOf('string');
++    expect(secondIds[secondIds.length - 1]).not.toBe(firstTurnMessageId);
++  }, 30_000);
++
+   it('drives initialize → new → prompt and streams the assistant text as agent_message_chunk', async () => {
+     const c = await boot();
+     scripted!.mockNextText('hello from the scripted model');

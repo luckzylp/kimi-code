@@ -1,0 +1,215 @@
+name: Patch Native Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream release tag to patch (default: patches/base.json upstreamTag)'
+        required: false
+        type: string
+      release-tag:
+        description: 'Release tag for the patched binaries (default: v<version>-patched)'
+        required: false
+        type: string
+  schedule:
+    - cron: '37 3 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: patch-native-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'MoonshotAI/kimi-code' }}
+
+jobs:
+  resolve:
+    name: Resolve upstream tag
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            TAG="$INPUT_TAG"
+          elif [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            TAG="$(gh api "repos/${UPSTREAM_REPO}/tags" --paginate --jq '.[].name' \
+              | grep -E '^@moonshot-ai/kimi-code@[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n1)"
+          else
+            TAG="$(node -p "require('./patches/base.json').upstreamTag")"
+          fi
+          [[ -n "$TAG" ]] || { echo "could not resolve an upstream tag" >&2; exit 1; }
+          VERSION="$(printf '%s' "$TAG" | sed -E 's#^@moonshot-ai/kimi-code@##; s#^v##')"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unsupported tag: $TAG" >&2; exit 1; }
+          RELEASE_TAG="${INPUT_RELEASE_TAG:-v${VERSION}-patched}"
+          echo "upstream_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]] \
+            && gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $RELEASE_TAG already exists; skipping" >&2
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Native bundle (${{ matrix.target }})
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: macos-15-intel
+            target: darwin-x64
+          - os: macos-15
+            target: darwin-arm64
+          - os: windows-2025-vs2026
+            target: win32-x64
+          - os: windows-11-arm
+            target: win32-arm64
+    steps:
+      - name: Checkout patch branch
+        uses: actions/checkout@v6
+
+      - name: Download upstream source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENCODED="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$UPSTREAM_TAG")"
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/tarball/${ENCODED}" \
+            -o upstream.tar.gz
+          mkdir -p source
+          tar -xzf upstream.tar.gz -C source --strip-components=1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: source/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: source/.nvmrc
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Apply patches
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          for patch in ../patches/[0-9]*.patch; do
+            echo "==> Applying $patch"
+            git apply --check "$patch"
+            git apply "$patch"
+          done
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify web assets
+        working-directory: source
+        run: node apps/kimi-code/scripts/check-web-assets.mjs
+
+      - name: Build native executable
+        working-directory: source
+        env:
+          KIMI_AZURE_TRUSTED_SIGNING: 'false'
+        run: pnpm --filter @moonshot-ai/kimi-code run build:native:sea
+
+      - name: Smoke test native executable
+        working-directory: source
+        run: pnpm --filter @moonshot-ai/kimi-code run test:native:smoke
+
+      - name: Package native artifact
+        working-directory: source
+        run: pnpm --filter @moonshot-ai/kimi-code run package:native
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kimi-code-native-${{ matrix.target }}
+          retention-days: 7
+          path: |
+            source/apps/kimi-code/dist-native/artifacts/kimi-code-${{ matrix.target }}.zip
+            source/apps/kimi-code/dist-native/artifacts/kimi-code-${{ matrix.target }}.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish patched release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download native artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: kimi-code-native-*
+          path: dist-native-release
+          merge-multiple: true
+
+      - name: Download upstream source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENCODED="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$UPSTREAM_TAG")"
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/tarball/${ENCODED}" \
+            -o upstream.tar.gz
+          mkdir -p source
+          tar -xzf upstream.tar.gz -C source --strip-components=1
+
+      - name: Produce manifest.json
+        env:
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+        run: node source/apps/kimi-code/scripts/native/produce-manifest.mjs dist-native-release "$UPSTREAM_TAG"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes "ACP-patched native binaries for upstream v${VERSION} (linux/darwin/win32 x x64/arm64)." \
+              --target "$GITHUB_SHA"
+          fi
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+        run: gh release upload "$RELEASE_TAG" dist-native-release/* --clobber

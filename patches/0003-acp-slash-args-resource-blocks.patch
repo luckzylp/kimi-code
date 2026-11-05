@@ -1,0 +1,159 @@
+diff --git a/packages/acp-server/src/convert.ts b/packages/acp-server/src/convert.ts
+index 3474b225b..02463d3b8 100644
+--- a/packages/acp-server/src/convert.ts
++++ b/packages/acp-server/src/convert.ts
+@@ -226,7 +226,7 @@ function escapeXmlAttr(s: string): string {
+     .replaceAll("'", '&apos;');
+ }
+ 
+-function fileLinkToTextRef(uri: string): string | null {
++export function fileLinkToTextRef(uri: string): string | null {
+   let url: URL;
+   try {
+     url = new URL(uri);
+diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/session.ts
+index c96dc9a56..623d42a45 100644
+--- a/packages/acp-server/src/session.ts
++++ b/packages/acp-server/src/session.ts
+@@ -89,14 +89,7 @@ import { log } from './log';
+ import { projectModelCatalog } from './model-catalog';
+ import { ACP_MODES, type AcpModeId, acpModeToToggles, DEFAULT_MODE_ID } from './modes';
+ import { projectHistoryToSessionUpdates } from './replay';
+-import { buildAcpSkillSlashCommands, detectSlashIntent } from './slash';
+-
+-/** Leading text of the first text block, if any (used for slash detection). */
+-function leadingText(blocks: readonly ContentBlock[]): string | undefined {
+-  const first = blocks[0];
+-  if (first !== undefined && first.type === 'text') return first.text;
+-  return undefined;
+-}
++import { buildAcpSkillSlashCommands, commandTextFromBlocks, detectSlashIntent } from './slash';
+ 
+ /**
+  * The engine's wire code for "another turn is active". A plain
+@@ -561,8 +554,12 @@ export class AcpSession {
+     // turn; skills activate through the engine (rendered skill prompt driven
+     // as a normal turn); unknown slash commands are answered locally with an
+     // "unknown command" notice (never sent to the model); non-slash input
+-    // goes to the model as-is.
+-    const text = leadingText(blocks);
++    // goes to the model as-is. `commandTextFromBlocks` reassembles the whole
++    // prompt (text + interspersed file resources) so a command whose args
++    // span multiple blocks — e.g. `/skill:x 请在 @a.ts 前面 参考 @b.ts 添加…`
++    // encoded by Zed as text/resource/text/resource/text — keeps its full
++    // argument text instead of truncating to the leading block.
++    const text = commandTextFromBlocks(blocks);
+     if (text !== undefined) {
+       const commands = this.resolveCommands();
+       const intent = detectSlashIntent(text, commands.skillCommandMap);
+diff --git a/packages/acp-server/src/slash.ts b/packages/acp-server/src/slash.ts
+index 08e80558c..f929fcd74 100644
+--- a/packages/acp-server/src/slash.ts
++++ b/packages/acp-server/src/slash.ts
+@@ -6,12 +6,15 @@
+ // (see `AcpSession.driveUnknownCommand`) — they never reach the model as
+ // prompt text. Non-slash input classifies as `passthrough` and does.
+ 
++import type { ContentBlock } from '@agentclientprotocol/sdk';
++
+ import { isUserActivatableSkillType, type SkillSummary } from '@moonshot-ai/agent-core-v2';
+ 
+ import {
+   ACP_BUILTIN_SLASH_COMMAND_NAMES,
+   type AcpBuiltinSlashCommandName,
+ } from './builtin-commands';
++import { fileLinkToTextRef } from './convert';
+ 
+ export interface ParsedSlashInput {
+   readonly name: string;
+@@ -35,6 +38,39 @@ export function parseSlashInput(input: string): ParsedSlashInput | null {
+   return { name, args };
+ }
+ 
++/**
++ * Reassemble the user-typed command text from prompt blocks. Zed renders
++ * `@file` mentions as `resource` / `resource_link` blocks interleaved with the
++ * surrounding text, so a slash command whose args mention files arrives as
++ * `[text][resource][text][resource][text]`. Only a full reassembly preserves
++ * the argument text that comes AFTER a resource — e.g.
++ * `/skill:x 请在 @a.ts 前面 参考 @b.ts 添加…` must not truncate to `/skill:x 请在`.
++ * Non-text leading blocks short-circuit to `undefined` (passthrough), matching
++ * the previous single-block behaviour.
++ */
++export function commandTextFromBlocks(blocks: readonly ContentBlock[]): string | undefined {
++  const first = blocks[0];
++  if (first === undefined || first.type !== 'text') return undefined;
++  let out = '';
++  for (const block of blocks) {
++    if (block.type === 'text') {
++      out += block.text;
++      continue;
++    }
++    const uri =
++      block.type === 'resource_link'
++        ? block.uri
++        : block.type === 'resource'
++          ? block.resource.uri
++          : undefined;
++    if (uri === undefined) continue; // image / audio / media contribute no command text
++    const ref = fileLinkToTextRef(uri) ?? uri;
++    if (out.length > 0 && !out.endsWith(' ') && !out.endsWith('\n')) out += ' ';
++    out += ref;
++  }
++  return out;
++}
++
+ export function resolveSkillCommand(
+   skillCommandMap: ReadonlyMap<string, string>,
+   commandName: string,
+diff --git a/packages/acp-server/test/skills.test.ts b/packages/acp-server/test/skills.test.ts
+index 32649035a..b0727f879 100644
+--- a/packages/acp-server/test/skills.test.ts
++++ b/packages/acp-server/test/skills.test.ts
+@@ -210,6 +210,46 @@ describe('acp-server skills / available commands', () => {
+     expect(history).not.toContain('/skill:acp-fixture');
+   }, 30_000);
+ 
++  it('reconstructs skill args that span interleaved text and file-resource blocks', async () => {
++    // Zed encodes `/skill:acp-fixture 请在 @a.ts:62 前面 参考 @b.ts:59-108 添加...`
++    // as a multi-part prompt: text block, then resource blocks inline
++    // (text → resource → text → resource → text). Slash detection must
++    // reassemble the full argument stream — including the text that comes
++    // AFTER a resource — instead of only the leading text block (`请在`).
++    const c = await bootWithFixtureSkill();
++    scripted!.mockNextText('FIXTURE');
++    const sessionId = await newSession(c);
++
++    const promptPromise = c.send('session/prompt', {
++      sessionId,
++      prompt: [
++        { type: 'text', text: '/skill:acp-fixture 请在 ' },
++        {
++          type: 'resource',
++          resource: { uri: 'file:///tmp/a.ts#L62', text: '// a.ts' },
++        },
++        { type: 'text', text: ' 前面 参考 ' },
++        {
++          type: 'resource',
++          resource: { uri: 'file:///tmp/b.ts#L59-108', text: '// b.ts' },
++        },
++        { type: 'text', text: ' 添加灵敏度配置支持' },
++      ],
++    });
++
++    await c.waitForSessionUpdate('agent_message_chunk', 10_000);
++    const result = (await promptPromise) as { stopReason: string };
++    expect(result.stopReason).toBe('end_turn');
++    expect(scripted!.callCount()).toBe(1);
++
++    const history = JSON.stringify(scripted!.callHistory()[0]);
++    expect(history).toContain(
++      'ARGUMENTS: 请在 /tmp/a.ts:62 前面 参考 /tmp/b.ts:59-108 添加灵敏度配置支持',
++    );
++    // The trailing blocks after the file resources must not be dropped.
++    expect(history).not.toContain('ARGUMENTS: 请在</skill-loaded>');
++  }, 30_000);
++
+   it('a builtin-source skill activates through its bare command name', async () => {
+     const c = await bootWithFixtureSkill();
+     scripted!.mockNextText('goal noted');
