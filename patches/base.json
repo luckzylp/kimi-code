@@ -1,9 +1,0 @@
-{
-  "upstreamRepo": "MoonshotAI/kimi-code",
-  "upstreamTag": "@moonshot-ai/kimi-code@2.5.0",
-  "patches": [
-    "0001-acp-server-coalesce-chunks-and-home-writes.patch",
-    "0002-acp-usage-update-on-session-setup.patch",
-    "0003-acp-slash-args-resource-blocks.patch"
-  ]
-}

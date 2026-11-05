@@ -2,8 +2,8 @@
 
 These patches carry the local ACP-server fixes on top of the official
 `MoonshotAI/kimi-code` source. They are applied with `git apply` to the
-source archive of `base.json`'s `upstreamTag`; nothing else from the fork is
-needed.
+source archive of the latest upstream stable release; nothing else from the
+fork is needed.
 
 | Patch | Upstream behavior it changes |
 | --- | --- |
@@ -18,10 +18,9 @@ needed.
    ```sh
    git diff <base>..<fix1> -- packages/acp-server > patches/0001-....patch
    ```
-3. Update `base.json` (`upstreamTag`, patch list).
-4. Run the `Patch Native Release` workflow with the new tag; if a patch no
-   longer applies, `git apply --check` fails the build with the offending
-   file.
+3. Run the `Patch Native Release` workflow. The resolve job applies every
+   patch to the freshly downloaded upstream archive; if any `git apply
+   --check` fails, the workflow stops before any build job starts.
 
 The workflow downloads the official source tarball and never clones the
 fork, so CI length is bounded by the archive plus `pnpm install`.
@@ -29,8 +28,9 @@ fork, so CI length is bounded by the archive plus `pnpm install`.
 ## Triggering it
 
 - **Manual**: Actions → `Patch Native Release` → Run workflow on this
-  branch. Leave `tag` empty to build `base.json`'s `upstreamTag`.
-- **Scheduled**: the daily run picks the newest stable upstream tag and
-  skips versions whose patched release already exists. GitHub only runs
-  schedules from the repository's default branch, so make this branch the
-  default of the fork (or rely on manual dispatch).
+  branch. Leave `tag` empty to build the latest upstream stable release;
+  set it only to rebuild a specific version.
+- **Scheduled**: the daily run also picks the latest stable upstream
+  release and skips versions whose patched release already exists. GitHub
+  only runs schedules from the repository's default branch, so make this
+  branch the default of the fork (or rely on manual dispatch).

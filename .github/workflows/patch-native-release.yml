@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Upstream release tag to patch (default: patches/base.json upstreamTag)'
+        description: 'Upstream release tag to patch (default: latest stable upstream release)'
         required: false
         type: string
       release-tag:
@@ -44,12 +44,16 @@ jobs:
           set -euo pipefail
           if [[ -n "${INPUT_TAG:-}" ]]; then
             TAG="$INPUT_TAG"
-          elif [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            TAG="$(gh api "repos/${UPSTREAM_REPO}/tags" --paginate --jq '.[].name' \
-              | grep -E '^@moonshot-ai/kimi-code@[0-9]+\.[0-9]+\.[0-9]+$' \
-              | sort -V | tail -n1)"
           else
-            TAG="$(node -p "require('./patches/base.json').upstreamTag")"
+            TAG="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+            if ! printf '%s' "$TAG" | grep -Eq '^(@moonshot-ai/kimi-code@|v)?[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "latest release tag '$TAG' is not a stable version; falling back to tags" >&2
+              TAGS="$(gh api "repos/${UPSTREAM_REPO}/tags" --paginate --jq '.[].name')"
+              TAG="$(printf '%s\n' "$TAGS" | grep -E '^@moonshot-ai/kimi-code@[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+              if [[ -z "$TAG" ]]; then
+                TAG="$(printf '%s\n' "$TAGS" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+              fi
+            fi
           fi
           [[ -n "$TAG" ]] || { echo "could not resolve an upstream tag" >&2; exit 1; }
           VERSION="$(printf '%s' "$TAG" | sed -E 's#^@moonshot-ai/kimi-code@##; s#^v##')"
@@ -65,6 +69,32 @@ jobs:
           else
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Verify patches apply to upstream source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.resolve.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENCODED="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$UPSTREAM_TAG")"
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/tarball/${ENCODED}" \
+            -o upstream.tar.gz
+          mkdir -p source
+          tar -xzf upstream.tar.gz -C source --strip-components=1
+          cd source
+          for patch in ../patches/[0-9]*.patch; do
+            echo "==> Checking $(basename "$patch")"
+            if ! git apply --check "$patch"; then
+              echo "::error::$(basename "$patch") does not apply to ${UPSTREAM_TAG}; aborting before any build."
+              exit 1
+            fi
+            git apply "$patch"
+          done
+          echo "All patches apply cleanly to ${UPSTREAM_TAG}."
 
   build:
     name: Native bundle (${{ matrix.target }})
