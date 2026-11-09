@@ -13,22 +13,41 @@ fork is needed.
 
 ## Zed npx cache bundle
 
-The workflow also publishes `kimi-code-zed-cache-<platform>-<version>-patched.tar.gz`
-for Zed's npx registry cache, plus a `.sha256` and a per-platform
-`kimi-code-zed-cache-<platform>.json` manifest. The bundle contains the
-complete `npx/kimi-code` install tree (patched `dist/main.mjs`, lockfiles,
-`node_modules`, `.bin` links), so no local `npm install` is needed.
+The workflow publishes per-platform cache bundles for Zed's npx registry
+cache, plus a `.sha256` and a per-platform `kimi-code-zed-cache-<platform>.json`
+manifest:
 
-On Linux, update the cache manually with:
+- Linux: `kimi-code-zed-cache-<platform>-<version>-patched.tar.gz`
+- Windows: `kimi-code-zed-cache-<platform>-<version>-patched.zip`
+
+Each bundle contains the complete `npx/kimi-code` install tree (patched
+`dist/main.mjs`, lockfiles, `node_modules`, `.bin` shims), so no local
+`npm install` is needed.
+
+On Linux:
 
 ```sh
 scripts/update-zed-cache.sh              # newest v<version>-patched release
 scripts/update-zed-cache.sh --dry-run    # download and validate only
 ```
 
-The script verifies the checksum and patch markers, refuses to downgrade a
-cache that Zed has moved to another version, swaps the tree atomically, and
-removes the previous tree after a successful swap. Restart the `kimi-code`
+On Windows:
+
+```powershell
+.\scripts\update-zed-cache.ps1
+.\scripts\update-zed-cache.ps1 -DryRun
+```
+
+Close the `kimi-code` agent before running the Windows script; Windows may
+refuse to rename a cache directory whose files are still open. The Windows
+script updates `%LOCALAPPDATA%\Zed\external_agents\registry\npx\kimi-code`
+by default; pass `-CacheDir` to override it. If the execution policy blocks
+the script, run it with
+`powershell -ExecutionPolicy Bypass -File .\scripts\update-zed-cache.ps1`.
+
+The scripts verify the checksum and patch markers, refuse to downgrade a
+cache that Zed has moved to another version, swap the tree atomically, and
+remove the previous tree after a successful swap. Restart the `kimi-code`
 agent in Zed afterwards.
 
 Scheduled runs skip releases that already exist. To add cache assets to an

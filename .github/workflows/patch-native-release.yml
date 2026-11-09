@@ -316,9 +316,179 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  zed-cache-win:
+    name: Zed npx cache (${{ matrix.target }})
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025-vs2026
+            target: win32-x64
+          - os: windows-11-arm
+            target: win32-arm64
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+    steps:
+      - name: Checkout patch branch
+        uses: actions/checkout@v6
+
+      - name: Download upstream source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENCODED="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$UPSTREAM_TAG")"
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/tarball/${ENCODED}" \
+            -o upstream.tar.gz
+          mkdir -p source
+          tar -xzf upstream.tar.gz -C source --strip-components=1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: source/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: source/.nvmrc
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Apply patches
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          for patch in ../patches/[0-9]*.patch; do
+            echo "==> Applying $patch"
+            git apply --check "$patch"
+            git apply "$patch"
+          done
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Build patched app
+        working-directory: source
+        shell: pwsh
+        env:
+          KIMI_CODE_BUILT_IN_CATALOG_FILE: ${{ runner.temp }}/built-in-catalog.json
+        run: |
+          node apps/kimi-code/scripts/update-catalog.mjs --out "$env:KIMI_CODE_BUILT_IN_CATALOG_FILE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Assemble Zed npx cache
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Write-Utf8NoBom([string]$Path, [string]$Text) {
+            [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
+          }
+
+          $cacheRoot = Join-Path $env:RUNNER_TEMP 'zed-cache'
+          $cache = Join-Path $cacheRoot 'npx\kimi-code'
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          $pkg = [ordered]@{ dependencies = [ordered]@{ '@moonshot-ai/kimi-code' = $env:VERSION } }
+          Write-Utf8NoBom (Join-Path $cache 'package.json') ($pkg | ConvertTo-Json -Depth 5)
+
+          Push-Location $cache
+          try {
+            npm install --no-audit --no-fund
+            if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
+          } finally {
+            Pop-Location
+          }
+
+          $sourceMain = Join-Path $env:GITHUB_WORKSPACE 'source\apps\kimi-code\dist\main.mjs'
+          $main = Join-Path $cache 'node_modules\@moonshot-ai\kimi-code\dist\main.mjs'
+          if (-not (Test-Path -LiteralPath $sourceMain)) { throw 'patched dist/main.mjs not found' }
+          Copy-Item -LiteralPath $sourceMain -Destination $main -Force
+
+          $hiddenLock = Join-Path $cache 'node_modules\.package-lock.json'
+          $binCmd = Join-Path $cache 'node_modules\.bin\kimi.cmd'
+          if (-not (Test-Path -LiteralPath $hiddenLock)) { throw 'node_modules/.package-lock.json missing' }
+          if (-not (Test-Path -LiteralPath $binCmd)) { throw '.bin/kimi.cmd missing' }
+          $cmdContent = Get-Content -LiteralPath $binCmd -Raw
+          if ($cmdContent -notmatch 'main\.mjs') { throw '.bin/kimi.cmd does not reference main.mjs' }
+
+          $installed = (Get-Content -LiteralPath (Join-Path $cache 'node_modules\@moonshot-ai\kimi-code\package.json') -Raw | ConvertFrom-Json).version
+          if ($installed -ne $env:VERSION) { throw "cache package is $installed, expected $($env:VERSION)" }
+
+          & node --check $main
+          if ($LASTEXITCODE -ne 0) { throw 'main.mjs failed node --check' }
+          foreach ($marker in @('MIN_ASSISTANT_CHUNK_CHARS', 'shouldServeLocally', 'commandTextFromBlocks', 'scheduleUsageUpdate')) {
+            if (-not (Select-String -LiteralPath $main -Pattern $marker -Quiet)) {
+              throw "patched bundle is missing $marker"
+            }
+          }
+
+          $oldHome = $env:KIMI_CODE_HOME
+          $env:KIMI_CODE_HOME = Join-Path $env:RUNNER_TEMP 'kimi-home'
+          New-Item -ItemType Directory -Force -Path $env:KIMI_CODE_HOME | Out-Null
+          try {
+            & node $main --version | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'main.mjs --version failed' }
+            & node $main acp --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'main.mjs acp --help failed' }
+          } finally {
+            if ($null -eq $oldHome) {
+              Remove-Item Env:KIMI_CODE_HOME -ErrorAction SilentlyContinue
+            } else {
+              $env:KIMI_CODE_HOME = $oldHome
+            }
+          }
+
+          $out = Join-Path $env:GITHUB_WORKSPACE 'out'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $asset = "kimi-code-zed-cache-$($env:TARGET)-$($env:VERSION)-patched.zip"
+          $zipPath = Join-Path $out $asset
+          if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory(
+            $cacheRoot,
+            $zipPath,
+            [System.IO.Compression.CompressionLevel]::Optimal,
+            $false
+          )
+          $sha = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLowerInvariant()
+          Set-Content -Path "$zipPath.sha256" -Value "$sha  $asset" -Encoding ascii
+          $manifest = [ordered]@{
+            schema = 1
+            upstreamVersion = $env:VERSION
+            releaseTag = $env:RELEASE_TAG
+            platform = $env:TARGET
+            asset = $asset
+            sha256 = $sha
+          }
+          Write-Utf8NoBom (Join-Path $out "kimi-code-zed-cache-$($env:TARGET).json") ($manifest | ConvertTo-Json)
+
+      - name: Upload Zed cache artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kimi-code-zed-cache-${{ matrix.target }}
+          retention-days: 7
+          path: out/*
+          if-no-files-found: error
+
   publish:
     name: Publish patched release
-    needs: [resolve, build, zed-cache]
+    needs: [resolve, build, zed-cache, zed-cache-win]
     runs-on: ubuntu-latest
     steps:
       - name: Download native artifacts
