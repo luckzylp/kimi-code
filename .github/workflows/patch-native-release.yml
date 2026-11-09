@@ -255,6 +255,18 @@ jobs:
         working-directory: source
         run: pnpm install --frozen-lockfile
 
+      - name: Pin patched workspace package
+        working-directory: source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          grep -q "MIN_ASSISTANT_CHUNK_CHARS" packages/acp-server/src/session.ts
+          mkdir -p apps/kimi-code/node_modules/@moonshot-ai
+          rm -rf apps/kimi-code/node_modules/@moonshot-ai/acp-server
+          ln -s "$GITHUB_WORKSPACE/source/packages/acp-server" \
+            apps/kimi-code/node_modules/@moonshot-ai/acp-server
+          readlink -f apps/kimi-code/node_modules/@moonshot-ai/acp-server
+
       - name: Build patched app
         working-directory: source
         env:
@@ -263,6 +275,15 @@ jobs:
           node apps/kimi-code/scripts/update-catalog.mjs --out "$KIMI_CODE_BUILT_IN_CATALOG_FILE"
           pnpm run build:packages
           pnpm --filter @moonshot-ai/kimi-code run build
+
+      - name: Verify patched bundle
+        working-directory: source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -l apps/kimi-code/dist/main.mjs
+          grep -c "MIN_ASSISTANT_CHUNK_CHARS" apps/kimi-code/dist/main.mjs || true
+          grep -n "pendingAssistantText\|Coalescing policy" apps/kimi-code/dist/main.mjs | head -10 || true
 
       - name: Assemble Zed npx cache
         env:
@@ -295,7 +316,7 @@ jobs:
           test "$(readlink -f "$CACHE/node_modules/.bin/kimi")" = "$(realpath -m "$MAIN")"
           test "$(node -p "require('$CACHE/node_modules/@moonshot-ai/kimi-code/package.json').version")" = "$VERSION"
           node --check "$MAIN"
-          for marker in MIN_ASSISTANT_CHUNK_CHARS shouldServeLocally commandTextFromBlocks scheduleUsageUpdate; do
+          for marker in pendingAssistantText shouldServeLocally commandTextFromBlocks scheduleUsageUpdate; do
             if ! grep -q "$marker" "$MAIN"; then
               echo "::error::patched bundle is missing marker: $marker"
               exit 1
@@ -387,6 +408,23 @@ jobs:
         working-directory: source
         run: pnpm install --frozen-lockfile
 
+      - name: Pin patched workspace package
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Select-String -LiteralPath 'packages\acp-server\src\session.ts' -Pattern 'MIN_ASSISTANT_CHUNK_CHARS' -Quiet)) {
+            throw 'patched acp-server source is missing MIN_ASSISTANT_CHUNK_CHARS'
+          }
+          $link = Join-Path $env:GITHUB_WORKSPACE 'source\apps\kimi-code\node_modules\@moonshot-ai\acp-server'
+          $target = Join-Path $env:GITHUB_WORKSPACE 'source\packages\acp-server'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $link) | Out-Null
+          if (Test-Path -LiteralPath $link) {
+            [System.IO.Directory]::Delete($link, $false)
+          }
+          New-Item -ItemType Junction -Path $link -Target $target | Out-Null
+          Get-Item -LiteralPath $link | Format-List FullName,Target
+
       - name: Build patched app
         working-directory: source
         shell: pwsh
@@ -399,6 +437,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm --filter @moonshot-ai/kimi-code run build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify patched bundle
+        working-directory: source
+        shell: pwsh
+        run: |
+          Get-Item 'apps\kimi-code\dist\main.mjs' | Format-List Length
+          Select-String -LiteralPath 'apps\kimi-code\dist\main.mjs' -Pattern 'MIN_ASSISTANT_CHUNK_CHARS' -Quiet
+          Select-String -LiteralPath 'apps\kimi-code\dist\main.mjs' -Pattern 'pendingAssistantText' -Quiet
 
       - name: Assemble Zed npx cache
         env:
@@ -442,7 +488,7 @@ jobs:
 
           & node --check $main
           if ($LASTEXITCODE -ne 0) { throw 'main.mjs failed node --check' }
-          foreach ($marker in @('MIN_ASSISTANT_CHUNK_CHARS', 'shouldServeLocally', 'commandTextFromBlocks', 'scheduleUsageUpdate')) {
+          foreach ($marker in @('pendingAssistantText', 'shouldServeLocally', 'commandTextFromBlocks', 'scheduleUsageUpdate')) {
             if (-not (Select-String -LiteralPath $main -Pattern $marker -Quiet)) {
               throw "patched bundle is missing $marker"
             }
