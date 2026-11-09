@@ -28,8 +28,8 @@ scripts/update-zed-cache.sh --dry-run    # download and validate only
 
 The script verifies the checksum and patch markers, refuses to downgrade a
 cache that Zed has moved to another version, swaps the tree atomically, and
-keeps the previous three trees for rollback. Restart the `kimi-code` agent in
-Zed afterwards.
+removes the previous tree after a successful swap. Restart the `kimi-code`
+agent in Zed afterwards.
 
 Scheduled runs skip releases that already exist. To add cache assets to an
 existing `v<version>-patched` release, dispatch the workflow manually.

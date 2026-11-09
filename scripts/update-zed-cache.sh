@@ -6,7 +6,7 @@
 #   scripts/update-zed-cache.sh [--dry-run] [TAG]
 #
 # TAG defaults to the newest v<version>-patched release. The cache is
-# replaced atomically and the previous tree is kept for rollback.
+# replaced atomically; the previous tree is removed after a successful swap.
 #
 # Environment:
 #   KIMI_CODE_REPO               GitHub repo (default: luckzylp/kimi-code)
@@ -200,8 +200,9 @@ fi
 mv "$NEW" "$D"
 installed=1
 
-find "$ROOT" -maxdepth 1 -type d -name '.kimi-zed-cache.old.*' -printf '%T@ %p\n' 2>/dev/null |
-  sort -rn | tail -n +4 | cut -d' ' -f2- | xargs -r rm -rf
+if [ -n "$old" ]; then
+  rm -rf -- "$old"
+fi
 
 printf 'updated %s\n' "$D"
 printf '  release: %s\n' "$TAG"
@@ -211,6 +212,3 @@ if ! grep -q '"kimi-code"' "$HOME/.config/zed/settings.json" 2>/dev/null; then
   printf '\nnote: ~/.config/zed/settings.json has no "kimi-code" agent entry.\n'
 fi
 printf '\nRestart the kimi-code agent in Zed to load the new build.\n'
-if [ -n "$old" ]; then
-  printf 'Rollback: mv %q %q\n' "$old" "$D"
-fi
