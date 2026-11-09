@@ -154,7 +154,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for patch in ../patches/[0-9]*.patch; do
+          PATCHES="$GITHUB_WORKSPACE/patches"
+          for patch in "$PATCHES"/[0-9]*.patch; do
             echo "==> Applying $patch"
             git apply --check "$patch"
             git apply "$patch"
@@ -245,7 +246,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for patch in ../patches/[0-9]*.patch; do
+          PATCHES="$GITHUB_WORKSPACE/patches"
+          for patch in "$PATCHES"/[0-9]*.patch; do
             echo "==> Applying $patch"
             git apply --check "$patch"
             git apply "$patch"
@@ -254,6 +256,24 @@ jobs:
       - name: Install dependencies
         working-directory: source
         run: pnpm install --frozen-lockfile
+
+      - name: Re-apply patches after install
+        working-directory: source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PATCHES="$GITHUB_WORKSPACE/patches"
+          for patch in "$PATCHES"/[0-9]*.patch; do
+            if git apply --check "$patch" 2>/dev/null; then
+              git apply "$patch"
+            elif git apply --reverse --check "$patch" 2>/dev/null; then
+              echo "already applied: $patch"
+            else
+              echo "::error::patch does not apply: $patch"
+              exit 1
+            fi
+          done
+          grep -n "MIN_ASSISTANT_CHUNK_CHARS" packages/acp-server/src/session.ts
 
       - name: Pin patched workspace package
         working-directory: source
@@ -398,7 +418,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for patch in ../patches/[0-9]*.patch; do
+          PATCHES="$GITHUB_WORKSPACE/patches"
+          for patch in "$PATCHES"/[0-9]*.patch; do
             echo "==> Applying $patch"
             git apply --check "$patch"
             git apply "$patch"
@@ -407,6 +428,24 @@ jobs:
       - name: Install dependencies
         working-directory: source
         run: pnpm install --frozen-lockfile
+
+      - name: Re-apply patches after install
+        working-directory: source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PATCHES="$GITHUB_WORKSPACE/patches"
+          for patch in "$PATCHES"/[0-9]*.patch; do
+            if git apply --check "$patch" 2>/dev/null; then
+              git apply "$patch"
+            elif git apply --reverse --check "$patch" 2>/dev/null; then
+              echo "already applied: $patch"
+            else
+              echo "::error::patch does not apply: $patch"
+              exit 1
+            fi
+          done
+          grep -n "MIN_ASSISTANT_CHUNK_CHARS" packages/acp-server/src/session.ts
 
       - name: Pin patched workspace package
         working-directory: source
