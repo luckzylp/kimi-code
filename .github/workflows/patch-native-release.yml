@@ -85,14 +85,12 @@ jobs:
             -o upstream.tar.gz
           mkdir -p source
           tar -xzf upstream.tar.gz -C source --strip-components=1
-          cd source
-          for patch in ../patches/[0-9]*.patch; do
+          for patch in "$GITHUB_WORKSPACE/patches"/[0-9]*.patch; do
             echo "==> Checking $(basename "$patch")"
-            if ! git apply --check "$patch"; then
+            if ! patch -p1 --batch --forward -d "$GITHUB_WORKSPACE/source" < "$patch"; then
               echo "::error::$(basename "$patch") does not apply to ${UPSTREAM_TAG}; aborting before any build."
               exit 1
             fi
-            git apply "$patch"
           done
           echo "All patches apply cleanly to ${UPSTREAM_TAG}."
 
@@ -149,21 +147,20 @@ jobs:
           cache: pnpm
           cache-dependency-path: source/pnpm-lock.yaml
 
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
       - name: Apply patches
         working-directory: source
         shell: bash
         run: |
           set -euo pipefail
-          PATCHES="$GITHUB_WORKSPACE/patches"
-          for patch in "$PATCHES"/[0-9]*.patch; do
+          for patch in "$GITHUB_WORKSPACE/patches"/[0-9]*.patch; do
             echo "==> Applying $patch"
-            git apply --check "$patch"
-            git apply "$patch"
+            patch -p1 --batch --forward -d "$GITHUB_WORKSPACE/source" < "$patch"
           done
-
-      - name: Install dependencies
-        working-directory: source
-        run: pnpm install --frozen-lockfile
+          grep -n "MIN_ASSISTANT_CHUNK_CHARS" packages/acp-server/src/session.ts
 
       - name: Verify web assets
         working-directory: source
@@ -241,37 +238,18 @@ jobs:
           cache: pnpm
           cache-dependency-path: source/pnpm-lock.yaml
 
-      - name: Apply patches
-        working-directory: source
-        shell: bash
-        run: |
-          set -euo pipefail
-          PATCHES="$GITHUB_WORKSPACE/patches"
-          for patch in "$PATCHES"/[0-9]*.patch; do
-            echo "==> Applying $patch"
-            git apply --check "$patch"
-            git apply "$patch"
-          done
-
       - name: Install dependencies
         working-directory: source
         run: pnpm install --frozen-lockfile
 
-      - name: Re-apply patches after install
+      - name: Apply patches
         working-directory: source
         shell: bash
         run: |
           set -euxo pipefail
-          PATCHES="$GITHUB_WORKSPACE/patches"
-          for patch in "$PATCHES"/[0-9]*.patch; do
-            if git apply --check "$patch" 2>/dev/null; then
-              git apply "$patch"
-            elif git apply --reverse --check "$patch" 2>/dev/null; then
-              echo "already applied: $patch"
-            else
-              echo "::error::patch does not apply: $patch"
-              exit 1
-            fi
+          for patch in "$GITHUB_WORKSPACE/patches"/[0-9]*.patch; do
+            echo "==> Applying $patch"
+            patch -p1 --batch --forward -d "$GITHUB_WORKSPACE/source" < "$patch"
           done
           grep -n "MIN_ASSISTANT_CHUNK_CHARS" packages/acp-server/src/session.ts
 
@@ -413,37 +391,18 @@ jobs:
           cache: pnpm
           cache-dependency-path: source/pnpm-lock.yaml
 
-      - name: Apply patches
-        working-directory: source
-        shell: bash
-        run: |
-          set -euo pipefail
-          PATCHES="$GITHUB_WORKSPACE/patches"
-          for patch in "$PATCHES"/[0-9]*.patch; do
-            echo "==> Applying $patch"
-            git apply --check "$patch"
-            git apply "$patch"
-          done
-
       - name: Install dependencies
         working-directory: source
         run: pnpm install --frozen-lockfile
 
-      - name: Re-apply patches after install
+      - name: Apply patches
         working-directory: source
         shell: bash
         run: |
           set -euxo pipefail
-          PATCHES="$GITHUB_WORKSPACE/patches"
-          for patch in "$PATCHES"/[0-9]*.patch; do
-            if git apply --check "$patch" 2>/dev/null; then
-              git apply "$patch"
-            elif git apply --reverse --check "$patch" 2>/dev/null; then
-              echo "already applied: $patch"
-            else
-              echo "::error::patch does not apply: $patch"
-              exit 1
-            fi
+          for patch in "$GITHUB_WORKSPACE/patches"/[0-9]*.patch; do
+            echo "==> Applying $patch"
+            patch -p1 --batch --forward -d "$GITHUB_WORKSPACE/source" < "$patch"
           done
           grep -n "MIN_ASSISTANT_CHUNK_CHARS" packages/acp-server/src/session.ts
 
