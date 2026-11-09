@@ -261,14 +261,15 @@ jobs:
           KIMI_CODE_BUILT_IN_CATALOG_FILE: ${{ runner.temp }}/built-in-catalog.json
         run: |
           node apps/kimi-code/scripts/update-catalog.mjs --out "$KIMI_CODE_BUILT_IN_CATALOG_FILE"
-          pnpm build
+          pnpm run build:packages
+          pnpm --filter @moonshot-ai/kimi-code run build
 
       - name: Assemble Zed npx cache
         env:
           TARGET: ${{ matrix.target }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           CACHE_ROOT="$RUNNER_TEMP/zed-cache"
           CACHE="$CACHE_ROOT/npx/kimi-code"
           mkdir -p "$CACHE"
@@ -280,10 +281,14 @@ jobs:
           )
 
           MAIN="$CACHE/node_modules/@moonshot-ai/kimi-code/dist/main.mjs"
-          test -f "$GITHUB_WORKSPACE/source/apps/kimi-code/dist/main.mjs"
-          install -m 775 \
-            "$GITHUB_WORKSPACE/source/apps/kimi-code/dist/main.mjs" \
-            "$MAIN"
+          SRC_MAIN="$GITHUB_WORKSPACE/source/apps/kimi-code/dist/main.mjs"
+          if [ ! -f "$SRC_MAIN" ]; then
+            echo "::error::patched dist/main.mjs not found at $SRC_MAIN"
+            ls -la "$GITHUB_WORKSPACE/source/apps/kimi-code" || true
+            find "$GITHUB_WORKSPACE/source/apps/kimi-code" -maxdepth 2 -name 'main.mjs' -print || true
+            exit 1
+          fi
+          install -m 775 "$SRC_MAIN" "$MAIN"
 
           test -f "$CACHE/node_modules/.package-lock.json"
           test -L "$CACHE/node_modules/.bin/kimi"
@@ -291,7 +296,10 @@ jobs:
           test "$(node -p "require('$CACHE/node_modules/@moonshot-ai/kimi-code/package.json').version")" = "$VERSION"
           node --check "$MAIN"
           for marker in MIN_ASSISTANT_CHUNK_CHARS shouldServeLocally commandTextFromBlocks scheduleUsageUpdate; do
-            grep -q "$marker" "$MAIN"
+            if ! grep -q "$marker" "$MAIN"; then
+              echo "::error::patched bundle is missing marker: $marker"
+              exit 1
+            fi
           done
           node "$MAIN" --version
           node "$MAIN" acp --help >/dev/null
@@ -387,7 +395,9 @@ jobs:
         run: |
           node apps/kimi-code/scripts/update-catalog.mjs --out "$env:KIMI_CODE_BUILT_IN_CATALOG_FILE"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pnpm build
+          pnpm run build:packages
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm --filter @moonshot-ai/kimi-code run build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Assemble Zed npx cache
