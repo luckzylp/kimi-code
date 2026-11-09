@@ -192,9 +192,133 @@ jobs:
             source/apps/kimi-code/dist-native/artifacts/kimi-code-${{ matrix.target }}.zip.sha256
           if-no-files-found: error
 
+  zed-cache:
+    name: Zed npx cache (${{ matrix.target }})
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+    steps:
+      - name: Checkout patch branch
+        uses: actions/checkout@v6
+
+      - name: Download upstream source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENCODED="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$UPSTREAM_TAG")"
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/tarball/${ENCODED}" \
+            -o upstream.tar.gz
+          mkdir -p source
+          tar -xzf upstream.tar.gz -C source --strip-components=1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: source/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: source/.nvmrc
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Apply patches
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          for patch in ../patches/[0-9]*.patch; do
+            echo "==> Applying $patch"
+            git apply --check "$patch"
+            git apply "$patch"
+          done
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Build patched app
+        working-directory: source
+        env:
+          KIMI_CODE_BUILT_IN_CATALOG_FILE: ${{ runner.temp }}/built-in-catalog.json
+        run: |
+          node apps/kimi-code/scripts/update-catalog.mjs --out "$KIMI_CODE_BUILT_IN_CATALOG_FILE"
+          pnpm build
+
+      - name: Assemble Zed npx cache
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CACHE_ROOT="$RUNNER_TEMP/zed-cache"
+          CACHE="$CACHE_ROOT/npx/kimi-code"
+          mkdir -p "$CACHE"
+          printf '{\n  "dependencies": {\n    "@moonshot-ai/kimi-code": "%s"\n  }\n}\n' \
+            "$VERSION" > "$CACHE/package.json"
+          (
+            cd "$CACHE"
+            npm install --no-audit --no-fund
+          )
+
+          MAIN="$CACHE/node_modules/@moonshot-ai/kimi-code/dist/main.mjs"
+          test -f "$GITHUB_WORKSPACE/source/apps/kimi-code/dist/main.mjs"
+          install -m 775 \
+            "$GITHUB_WORKSPACE/source/apps/kimi-code/dist/main.mjs" \
+            "$MAIN"
+
+          test -f "$CACHE/node_modules/.package-lock.json"
+          test -L "$CACHE/node_modules/.bin/kimi"
+          test "$(readlink -f "$CACHE/node_modules/.bin/kimi")" = "$(realpath -m "$MAIN")"
+          test "$(node -p "require('$CACHE/node_modules/@moonshot-ai/kimi-code/package.json').version")" = "$VERSION"
+          node --check "$MAIN"
+          for marker in MIN_ASSISTANT_CHUNK_CHARS shouldServeLocally commandTextFromBlocks scheduleUsageUpdate; do
+            grep -q "$marker" "$MAIN"
+          done
+          node "$MAIN" --version
+          node "$MAIN" acp --help >/dev/null
+
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          ASSET="kimi-code-zed-cache-${TARGET}-${VERSION}-patched.tar.gz"
+          tar -czf "$GITHUB_WORKSPACE/out/$ASSET" -C "$CACHE_ROOT" npx/kimi-code
+          (
+            cd "$GITHUB_WORKSPACE/out"
+            sha256sum "$ASSET" > "$ASSET.sha256"
+            SHA="$(cut -d' ' -f1 "$ASSET.sha256")"
+            printf '{\n  "schema": 1,\n  "upstreamVersion": "%s",\n  "releaseTag": "%s",\n  "platform": "%s",\n  "asset": "%s",\n  "sha256": "%s"\n}\n' \
+              "$VERSION" "$RELEASE_TAG" "$TARGET" "$ASSET" "$SHA" \
+              > "kimi-code-zed-cache-${TARGET}.json"
+          )
+
+      - name: Upload Zed cache artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kimi-code-zed-cache-${{ matrix.target }}
+          retention-days: 7
+          path: out/*
+          if-no-files-found: error
+
   publish:
     name: Publish patched release
-    needs: [resolve, build]
+    needs: [resolve, build, zed-cache]
     runs-on: ubuntu-latest
     steps:
       - name: Download native artifacts
@@ -202,6 +326,13 @@ jobs:
         with:
           pattern: kimi-code-native-*
           path: dist-native-release
+          merge-multiple: true
+
+      - name: Download Zed cache artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: kimi-code-zed-cache-*
+          path: dist-zed-cache
           merge-multiple: true
 
       - name: Download upstream source
@@ -235,7 +366,7 @@ jobs:
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$RELEASE_TAG" \
-              --notes "ACP-patched native binaries for upstream v${VERSION} (linux/darwin/win32 x x64/arm64)." \
+              --notes "ACP-patched native binaries and Zed npx cache bundles for upstream v${VERSION}." \
               --target "$GITHUB_SHA"
           fi
 
@@ -243,4 +374,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
-        run: gh release upload "$RELEASE_TAG" dist-native-release/* --repo "$GITHUB_REPOSITORY" --clobber
+        run: gh release upload "$RELEASE_TAG" dist-native-release/* dist-zed-cache/* --repo "$GITHUB_REPOSITORY" --clobber

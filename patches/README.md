@@ -11,6 +11,29 @@ fork is needed.
 | `0002` | Emits `usage_update` after session setup, on model switch, and after compaction so Zed keeps the context-size indicator in sync. |
 | `0003` | Reassembles slash-command arguments across interleaved text and `resource`/`resource_link` blocks, so `@file` mentions no longer truncate them. |
 
+## Zed npx cache bundle
+
+The workflow also publishes `kimi-code-zed-cache-<platform>-<version>-patched.tar.gz`
+for Zed's npx registry cache, plus a `.sha256` and a per-platform
+`kimi-code-zed-cache-<platform>.json` manifest. The bundle contains the
+complete `npx/kimi-code` install tree (patched `dist/main.mjs`, lockfiles,
+`node_modules`, `.bin` links), so no local `npm install` is needed.
+
+On Linux, update the cache manually with:
+
+```sh
+scripts/update-zed-cache.sh              # newest v<version>-patched release
+scripts/update-zed-cache.sh --dry-run    # download and validate only
+```
+
+The script verifies the checksum and patch markers, refuses to downgrade a
+cache that Zed has moved to another version, swaps the tree atomically, and
+keeps the previous three trees for rollback. Restart the `kimi-code` agent in
+Zed afterwards.
+
+Scheduled runs skip releases that already exist. To add cache assets to an
+existing `v<version>-patched` release, dispatch the workflow manually.
+
 ## Refreshing to a newer upstream version
 
 1. Rebase the three commits from `opt/acp-server` onto the new upstream tag.
