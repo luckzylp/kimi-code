@@ -10,6 +10,7 @@ fork is needed.
 | `0001` | Coalesces streaming deltas into sentence-sized `agent_message_chunk` notifications, and serves writes under the agent home dir locally instead of through the ACP client. |
 | `0002` | Emits `usage_update` after session setup, on model switch, and after compaction so Zed keeps the context-size indicator in sync. |
 | `0003` | Reassembles slash-command arguments across interleaved text and `resource`/`resource_link` blocks, so `@file` mentions no longer truncate them. |
+| `0004` | Releases a client terminal only after the call's final `tool_call_update` has been written, so the update never references a terminal the client already dropped. Previously every Bash call released the terminal before reporting its result, and Zed rejected that update (`Terminal with id ... not found`), which wedged the thread's update pipeline: the UI froze, the send button greyed out, and the agent kept running headless. |
 
 ## Zed npx cache bundle
 
