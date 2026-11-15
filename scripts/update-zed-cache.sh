@@ -169,7 +169,7 @@ installed_version="$(node -e '
 [ "$installed_version" = "$VERSION" ] || die "cache package is $installed_version, expected $VERSION"
 
 node --check "$MAIN"
-for marker in MIN_ASSISTANT_CHUNK_CHARS shouldServeLocally commandTextFromBlocks scheduleUsageUpdate; do
+for marker in MIN_ASSISTANT_CHUNK_CHARS shouldServeLocally commandTextFromBlocks scheduleUsageUpdate deferTerminalRelease; do
   grep -q "$marker" "$MAIN" || die "patched bundle is missing $marker"
 done
 mkdir -p "$tmp/home"

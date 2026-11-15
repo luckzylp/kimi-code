@@ -222,7 +222,7 @@ try {
         Fail 'main.mjs failed node --check'
     }
 
-    foreach ($marker in @('MIN_ASSISTANT_CHUNK_CHARS', 'shouldServeLocally', 'commandTextFromBlocks', 'scheduleUsageUpdate')) {
+    foreach ($marker in @('MIN_ASSISTANT_CHUNK_CHARS', 'shouldServeLocally', 'commandTextFromBlocks', 'scheduleUsageUpdate', 'deferTerminalRelease')) {
         if (-not (Select-String -LiteralPath $main -Pattern $marker -Quiet)) {
             Fail "patched bundle is missing $marker"
         }
