@@ -6,12 +6,15 @@
 // (see `AcpSession.driveUnknownCommand`) — they never reach the model as
 // prompt text. Non-slash input classifies as `passthrough` and does.
 
+import type { ContentBlock } from '@agentclientprotocol/sdk';
+
 import { isUserActivatableSkillType, type SkillSummary } from '@moonshot-ai/agent-core-v2';
 
 import {
   ACP_BUILTIN_SLASH_COMMAND_NAMES,
   type AcpBuiltinSlashCommandName,
 } from './builtin-commands';
+import { fileLinkToTextRef } from './convert';
 
 export interface ParsedSlashInput {
   readonly name: string;
@@ -33,6 +36,39 @@ export function parseSlashInput(input: string): ParsedSlashInput | null {
   const args = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx + 1).trim();
   if (name.includes('/')) return null;
   return { name, args };
+}
+
+/**
+ * Reassemble the user-typed command text from prompt blocks. Zed renders
+ * `@file` mentions as `resource` / `resource_link` blocks interleaved with the
+ * surrounding text, so a slash command whose args mention files arrives as
+ * `[text][resource][text][resource][text]`. Only a full reassembly preserves
+ * the argument text that comes AFTER a resource — e.g.
+ * `/skill:x 请在 @a.ts 前面 参考 @b.ts 添加…` must not truncate to `/skill:x 请在`.
+ * Non-text leading blocks short-circuit to `undefined` (passthrough), matching
+ * the previous single-block behaviour.
+ */
+export function commandTextFromBlocks(blocks: readonly ContentBlock[]): string | undefined {
+  const first = blocks[0];
+  if (first === undefined || first.type !== 'text') return undefined;
+  let out = '';
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      out += block.text;
+      continue;
+    }
+    const uri =
+      block.type === 'resource_link'
+        ? block.uri
+        : block.type === 'resource'
+          ? block.resource.uri
+          : undefined;
+    if (uri === undefined) continue; // image / audio / media contribute no command text
+    const ref = fileLinkToTextRef(uri) ?? uri;
+    if (out.length > 0 && !out.endsWith(' ') && !out.endsWith('\n')) out += ' ';
+    out += ref;
+  }
+  return out;
 }
 
 export function resolveSkillCommand(

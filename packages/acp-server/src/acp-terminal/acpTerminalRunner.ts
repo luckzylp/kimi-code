@@ -9,6 +9,7 @@ import type {
   IHostFileSystem,
   IHostProcess,
   IHostProcessService,
+  IBootstrapOptions,
   ISessionContext,
   Environment,
   EnvironmentPath,
@@ -199,7 +200,14 @@ class AcpSessionEnvironment implements Environment {
       basename: (p: string) => path.basename(p),
       dirname: (p: string) => path.dirname(p),
     };
-    this.fs = new AcpHostFileSystem({ sessionId } as unknown as ISessionContext, connection);
+    this.fs = new AcpHostFileSystem(
+      { sessionId } as unknown as ISessionContext,
+      connection,
+      {
+        homeDir: environment.homeDir,
+        platform: environment.pathClass === 'win32' ? 'win32' : process.platform,
+      } as unknown as IBootstrapOptions,
+    );
     this.process = new AcpProcessService(sessionId, cwd, connection, local);
   }
 

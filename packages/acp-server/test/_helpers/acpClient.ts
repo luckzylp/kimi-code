@@ -27,6 +27,12 @@ export interface TestClient {
   /** Resolve once a `session/update` whose `update.sessionUpdate` matches arrives. */
   waitForSessionUpdate(sessionUpdate: string, timeoutMs?: number): Promise<RpcMessage>;
   /**
+   * Consume one `session/update` of the given kind from the received buffer
+   * so a later {@link waitForSessionUpdate} for the same kind does not
+   * re-resolve with the stale notification. Returns the consumed message.
+   */
+  drainSessionUpdate(sessionUpdate: string, timeoutMs?: number): Promise<RpcMessage>;
+  /**
    * Register a handler for an agent-initiated request method (e.g.
    * `session/request_permission`). The handler's return value is sent back as
    * the JSON-RPC `result`; a thrown error is sent as a JSON-RPC `error`.
@@ -150,6 +156,13 @@ export async function createTestClient(opts: {
     return received.filter((m) => m.method === 'session/update');
   }
 
+  async function drainSessionUpdate(sessionUpdate: string, timeoutMs = 5_000): Promise<RpcMessage> {
+    const msg = await waitForSessionUpdate(sessionUpdate, timeoutMs);
+    const i = received.indexOf(msg);
+    if (i >= 0) received.splice(i, 1);
+    return msg;
+  }
+
   function waitForSessionUpdate(sessionUpdate: string, timeoutMs = 5_000): Promise<RpcMessage> {
     const existing = sessionUpdates().find((m) => {
       const update = (m.params as { update?: { sessionUpdate?: string } } | undefined)?.update;
@@ -180,5 +193,5 @@ export async function createTestClient(opts: {
     requestHandlers.set(method, handler);
   }
 
-  return { send, notify, received, sessionUpdates, waitForSessionUpdate, onRequest, server, close };
+  return { send, notify, received, sessionUpdates, waitForSessionUpdate, drainSessionUpdate, onRequest, server, close };
 }

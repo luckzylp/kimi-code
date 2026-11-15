@@ -5,6 +5,13 @@
  * other operation (binary IO, stat/realpath/readdir/mkdir/remove, exclusive
  * create) to a node-local inner backend.
  *
+ * Paths inside the agent's own data directory (the bootstrap `homeDir`,
+ * e.g. `~/.kimi-code` — which holds session dirs and plan documents) are
+ * served by the local backend too: ACP clients only grant the workspace
+ * `cwd`, so a reverse-RPC to write `~/.kimi-code/sessionId/.../plan.md`
+ * would be rejected by the host. Session-internal files must never cross to
+ * the client, mirroring the legacy adapter's `homeRoot` local fallback.
+ *
  * Registered at Session scope so it shadows the App-scope node-local
  * `IHostFileSystem` for Session- and Agent-scope consumers (the os file tools),
  * while App-scope consumers (persistence, skill loading, workspace registry)
@@ -15,7 +22,7 @@
  * connection.
  */
 
-import { dirname } from 'node:path';
+import { dirname, posix, win32 } from 'node:path';
 
 import { RequestError } from '@agentclientprotocol/sdk';
 import {
@@ -31,6 +38,7 @@ import {
   type HostFileStat,
   type HostWalkOptions,
   type HostWalkVisitor,
+  IBootstrapOptions,
   IHostFileSystem,
   ISessionContext,
   LifecycleScope,
@@ -74,9 +82,32 @@ export class AcpHostFileSystem implements IHostFileSystem {
   constructor(
     @ISessionContext private readonly ctx: ISessionContext,
     @IAcpConnection private readonly connection: IAcpConnection,
+    @IBootstrapOptions private readonly bootstrap: IBootstrapOptions,
   ) {}
 
+  /**
+   * True when `target` is inside the agent's own data directory (the
+   * resolved `~/.kimi-code` home). Uses the same path-boundary logic as the
+   * workspace roots so a sibling like `~/.kimi-codeX` does not match.
+   */
+  private isWithinHomeRoot(target: string): boolean {
+    const consumer = this.bootstrap.platform === 'win32' ? win32 : posix;
+    const resolved = consumer.isAbsolute(target)
+      ? target
+      : consumer.resolve(this.ctx.cwd, target);
+    const resolvedHome = consumer.resolve(this.bootstrap.homeDir);
+    const rel = consumer.relative(resolvedHome, resolved);
+    return !rel.startsWith('..') && !consumer.isAbsolute(rel);
+  }
+
+  private shouldServeLocally(path: string): boolean {
+    return this.isWithinHomeRoot(path);
+  }
+
   async readText(path: string, options?: ReadTextOptions): Promise<string> {
+    if (this.shouldServeLocally(path)) {
+      return this.inner.readText(path, options);
+    }
     if (!this.connection.fsReadTextFile) {
       return this.inner.readText(path, options);
     }
@@ -94,6 +125,9 @@ export class AcpHostFileSystem implements IHostFileSystem {
    * matching host fs error so callers can create the parent and retry.
    */
   async writeText(path: string, data: string): Promise<void> {
+    if (this.shouldServeLocally(path)) {
+      return this.inner.writeText(path, data);
+    }
     if (!this.connection.fsWriteTextFile) {
       return this.inner.writeText(path, data);
     }
@@ -123,6 +157,9 @@ export class AcpHostFileSystem implements IHostFileSystem {
    * client file, while all other read failures are propagated.
    */
   async appendText(path: string, data: string): Promise<void> {
+    if (this.shouldServeLocally(path)) {
+      return this.inner.appendText(path, data);
+    }
     if (!this.connection.fsReadTextFile || !this.connection.fsWriteTextFile) {
       return this.inner.appendText(path, data);
     }
@@ -151,8 +188,12 @@ export class AcpHostFileSystem implements IHostFileSystem {
   /**
    * Bridge byte writes only when the payload is valid UTF-8. Binary data stays
    * on the local backend rather than being silently replaced with U+FFFD.
+   * Home-dir paths always go local (see {@link shouldServeLocally}).
    */
   async writeBytes(path: string, data: Uint8Array): Promise<void> {
+    if (this.shouldServeLocally(path)) {
+      return this.inner.writeBytes(path, data);
+    }
     if (!this.connection.fsWriteTextFile) {
       return this.inner.writeBytes(path, data);
     }
