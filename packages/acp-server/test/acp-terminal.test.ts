@@ -13,9 +13,20 @@ import type { IAcpConnection, IAcpTerminalHandle } from '../src/acp-fs/acpConnec
 import { AcpHostFileSystem } from '../src/acp-fs/acpFsService';
 import { AcpEnvironmentProviderFactory } from '../src/acp-terminal/acpTerminalRunner';
 
+interface DeferredRelease {
+  readonly sessionId: string;
+  readonly terminalId: string;
+  readonly release: () => Promise<unknown>;
+}
+
 function makeConnection(
-  options: { terminalEnabled?: boolean; createTerminal?: () => IAcpTerminalHandle } = {},
+  options: {
+    terminalEnabled?: boolean;
+    createTerminal?: () => IAcpTerminalHandle;
+    deferred?: DeferredRelease[];
+  } = {},
 ): IAcpConnection {
+  const deferred = options.deferred ?? [];
   return {
     _serviceBrand: undefined,
     bound: true,
@@ -28,6 +39,11 @@ function makeConnection(
     bindTerminalCapability: () => {},
     notifyTerminalCreated: () => {},
     onTerminalCreated: () => () => {},
+    deferTerminalRelease: (sessionId, terminalId, release) => {
+      deferred.push({ sessionId, terminalId, release });
+    },
+    releaseTerminal: () => {},
+    releaseSessionTerminals: () => {},
   };
 }
 
@@ -196,5 +212,45 @@ describe('AcpProcessService local fallback', () => {
     expect(created).toBe(0);
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({ command: 'rg', args: ['--files', '--hidden'], options: { cwd: '/repo' } });
+  });
+
+  it('parks the client release on dispose instead of releasing inline', async () => {
+    const releases: string[] = [];
+    const handle: IAcpTerminalHandle = {
+      id: 'term-park',
+      currentOutput: async () => ({ output: '', truncated: false }),
+      waitForExit: async () => ({ exitCode: 0 }),
+      kill: async () => ({}),
+      release: async () => {
+        releases.push('released');
+        return {};
+      },
+    };
+    const deferred: DeferredRelease[] = [];
+    const connection = makeConnection({ terminalEnabled: true, createTerminal: () => handle, deferred });
+    const environment = await bindEnvironment(makeEnvironment(), { connection });
+
+    const proc = await environment.process!.spawn('/bin/bash', ['-c', 'echo hi'], {
+      env: { NO_COLOR: '1', TERM: 'dumb' },
+    });
+
+    // `dispose()` runs inside the Bash tool's `finally`, i.e. BEFORE the
+    // engine publishes `tool.result`. Releasing here would delete the
+    // terminal at the client while the session still owes that call a final
+    // `tool_call_update`; the update would then be rejected ("Terminal with
+    // id ... not found"). The release must therefore be parked.
+    await proc.dispose();
+    expect(releases).toEqual([]);
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]).toMatchObject({ sessionId: 's1', terminalId: 'term-park' });
+
+    // Idempotent: a second dispose parks nothing more.
+    await proc.dispose();
+    expect(deferred).toHaveLength(1);
+
+    // The session claims the parked release once the final update is on the
+    // wire, and it releases exactly once.
+    await deferred[0]!.release();
+    expect(releases).toEqual(['released']);
   });
 });

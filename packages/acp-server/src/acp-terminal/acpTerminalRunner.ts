@@ -72,7 +72,7 @@ class AcpProcessService implements IHostProcessService {
       shellCommand: args[1] ?? '',
       terminalId: handle.id,
     });
-    return new AcpTerminalProcess(handle);
+    return new AcpTerminalProcess(handle, this.sessionId, this.connection);
   }
 }
 
@@ -89,7 +89,11 @@ class AcpTerminalProcess implements IHostProcess {
   private readonly waitPromise: Promise<number>;
   private released = false;
 
-  constructor(private readonly handle: IAcpTerminalHandle) {
+  constructor(
+    private readonly handle: IAcpTerminalHandle,
+    private readonly sessionId: string,
+    private readonly connection: IAcpConnection,
+  ) {
     this.stdin = new Writable({
       write(_chunk, _encoding, callback) {
         callback();
@@ -124,10 +128,17 @@ class AcpTerminalProcess implements IHostProcess {
     if (this.released) return;
     this.released = true;
     this.stopPolling();
-    try {
-      await this.handle.release();
-    } catch {
-    }
+    // Hand the `terminal/release` to the connection instead of awaiting it
+    // here, for two independent reasons:
+    //  1. Ordering — `dispose()` runs inside the Bash tool's `finally`, i.e.
+    //     before the engine publishes `tool.result`. Releasing now deletes
+    //     the terminal at the client while the session still owes that call a
+    //     final `tool_call_update`; clients reject such an update ("Terminal
+    //     with id ... not found") and their session-update pipeline wedges.
+    //     The session claims the parked release after pushing the update.
+    //  2. Liveness — a reverse-RPC awaited on this path leaves the whole tool
+    //     call (and the turn) hostage to a client that never answers.
+    this.connection.deferTerminalRelease(this.sessionId, this.handle.id, () => this.handle.release());
   }
 
   private async run(): Promise<number> {

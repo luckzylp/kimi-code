@@ -34,6 +34,9 @@ function makeConnection(
     bindTerminalCapability: () => {},
     notifyTerminalCreated: () => {},
     onTerminalCreated: () => () => {},
+    deferTerminalRelease: () => {},
+    releaseTerminal: () => {},
+    releaseSessionTerminals: () => {},
   };
 }
 

@@ -1111,13 +1111,29 @@ describe('acp-server terminal reverse-RPC (clientCapabilities.terminal)', () => 
     expect(t.released).toBe(true);
     expect(t.killed).toBe(false);
 
-    // The tool card carries the terminal embed — not a textual copy of the
-    // output (the client already renders the bytes in the terminal pane).
+    // The card embeds the live client terminal while the command runs…
     const updates = toolCallUpdates(c);
     const attached = updates.find((u) => u.content?.[0]?.type === 'terminal');
     expect(attached?.content?.[0]?.terminalId).toBe(t.id);
+    // …and the final update replaces that embed with the captured output.
+    // The client drops the terminal as soon as it is released, so an update
+    // that still referenced the terminal id would be rejected (Zed answers
+    // `Terminal with id ... not found` and stops applying that thread's
+    // session updates: the UI freezes while the agent keeps running).
     const completed = updates.find((u) => u.status === 'completed');
-    expect(completed?.content).toEqual([{ type: 'terminal', terminalId: t.id }]);
+    expect(completed?.content).toEqual([
+      { type: 'content', content: { type: 'text', text: expect.stringContaining('hello_from_terminal') } },
+    ]);
+
+    // Ordering guarantee: the final update reaches the client BEFORE the
+    // release that deletes the terminal it used to embed.
+    const completedIndex = c.received.findIndex((m) => {
+      const update = (m.params as { update?: ToolCallUpdate } | undefined)?.update;
+      return update?.sessionUpdate === 'tool_call_update' && update.status === 'completed';
+    });
+    const releaseIndex = c.received.findIndex((m) => m.method === 'terminal/release');
+    expect(completedIndex).toBeGreaterThan(-1);
+    expect(releaseIndex).toBeGreaterThan(completedIndex);
 
     // …while the model still received the captured output in the tool
     // result fed back on the second generate() call.

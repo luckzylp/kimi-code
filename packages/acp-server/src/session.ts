@@ -29,6 +29,7 @@ import type {
   SessionConfigOption,
   SessionModeState,
   SessionNotification,
+  ToolCallContent,
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
@@ -63,7 +64,7 @@ import {
   runBuiltinSlashCommand,
 } from './builtin-commands';
 import { buildSessionConfigOptions } from './config-options';
-import { acpBlocksToContentParts, compressPromptImageParts } from './convert';
+import { acpBlocksToContentParts, compressPromptImageParts, toolResultToAcpContent } from './convert';
 import {
   acpToolCallId,
   availableCommandsUpdateNotification,
@@ -283,11 +284,13 @@ export class AcpSession {
   private readonly bashCallsAwaitingTerminal = new Map<string, string>();
   /**
    * Tool calls whose execution runs in a client terminal: ACP wire toolCallId
-   * → terminalId. Their terminal `tool_call_update` carries a
-   * `{type: 'terminal'}` content entry instead of the textual output (the
-   * client already renders the bytes in the terminal pane — showing them in
-   * the card too would duplicate them). The model still receives the full
-   * captured output; only the client-facing card content is de-duplicated.
+   * → terminalId. The terminal is attached to the card as a
+   * `{type: 'terminal'}` content entry while the command runs; the terminal
+   * *result* replaces it with the captured output (see
+   * {@link settleTerminalBackedCall}), because the terminal is released right
+   * after that update and the client stops holding it. The model always
+   * receives the full captured output; only the client-facing card content
+   * changes shape.
    */
   private readonly terminalBackedCalls = new Map<string, string>();
   /** Bridges engine approval / ask-user requests to the ACP client. */
@@ -454,6 +457,10 @@ export class AcpSession {
     for (const subscription of this.subscriptions.splice(0)) {
       subscription.dispose();
     }
+    // Safety net: a terminal whose tool call never reported a result (turn
+    // cancelled, subagent command) is parked on the connection and would
+    // otherwise linger until the fallback timer fires on a dead session.
+    this.acpConnection.releaseSessionTerminals(this.sessionId);
   }
 
   /**
@@ -920,25 +927,61 @@ export class AcpSession {
     const terminalId = this.terminalBackedCalls.get(key);
     this.terminalBackedCalls.delete(key);
     if (terminalId !== undefined) {
-      // Terminal-backed call: the client already renders the output bytes in
-      // the terminal pane, so the card gets the terminal embed instead of a
-      // textual copy. The full output still reached the model (and the
-      // persisted wire record) untouched.
-      this.emit({
-        sessionId: this.sessionId,
-        update: {
-          sessionUpdate: 'tool_call_update',
-          toolCallId: key,
-          status: event.isError === true ? 'failed' : 'completed',
-          content: [{ type: 'terminal', terminalId }],
-          locations,
-        },
-      });
+      void this.settleTerminalBackedCall(key, terminalId, event, locations);
       return;
     }
     this.emit(
       toolResultToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, locations),
     );
+  }
+
+  /**
+   * Close out a Bash call that ran in a client terminal, then release that
+   * terminal.
+   *
+   * The final `tool_call_update` carries the captured output as text instead
+   * of a `{type: 'terminal'}` embed: the embed is only valid while the client
+   * still holds the terminal, and releasing it (right after this update) is
+   * exactly what makes the client drop it. An update that still referenced it
+   * would be rejected by the client — Zed answers
+   * `Terminal with id ... not found` and stops applying session updates for
+   * the thread, so the turn's UI freezes while the agent keeps running.
+   *
+   * The release is claimed only once the update is on the wire, which is what
+   * keeps the client's view of the terminal alive long enough to render the
+   * in-progress embed emitted at `terminal/create`.
+   */
+  private async settleTerminalBackedCall(
+    key: string,
+    terminalId: string,
+    event: AgentEventPayloads['tool.result'],
+    locations: ToolCallLocation[] | undefined,
+  ): Promise<void> {
+    try {
+      await this.conn.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: key,
+          status: event.isError === true ? 'failed' : 'completed',
+          content: terminalResultPreview(event as unknown as ToolResultEvent),
+          // No `rawOutput`: the captured output can reach ~10 MB, and this
+          // update is a single JSON-RPC frame. The card gets a bounded tail
+          // preview instead — the model already received the full output, and
+          // the client rendered the live bytes in its terminal pane.
+          locations,
+        },
+      });
+    } catch (error) {
+      log.warn('acp: failed to push terminal tool_call_update', {
+        sessionId: this.sessionId,
+        toolCallId: key,
+        terminalId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      this.acpConnection.releaseTerminal(terminalId);
+    }
   }
 
   /**
@@ -1317,6 +1360,38 @@ export class AcpSession {
       });
     }
   }
+}
+
+/**
+ * Bound on the textual preview a terminal-backed call puts on its card. The
+ * captured output can reach ~10 MB (`DEFAULT_TOOL_RESULT_MAX_RETAINED_CHARS`
+ * in the engine), and this update travels as a single JSON-RPC frame, so the
+ * card gets the trailing window — where failures surface — and a note saying
+ * how much was dropped.
+ */
+const TERMINAL_RESULT_PREVIEW_CHARS = 16 * 1024;
+
+/**
+ * Project a tool result into card content, keeping at most
+ * {@link TERMINAL_RESULT_PREVIEW_CHARS} characters of any text entry (the
+ * tail). Non-text entries pass through untouched.
+ */
+function terminalResultPreview(event: ToolResultEvent): ToolCallContent[] {
+  return toolResultToAcpContent(event).flatMap((entry): ToolCallContent[] => {
+    if (entry.type !== 'content' || entry.content.type !== 'text') return [entry];
+    const text = entry.content.text;
+    if (text.length <= TERMINAL_RESULT_PREVIEW_CHARS) return [entry];
+    const omitted = text.length - TERMINAL_RESULT_PREVIEW_CHARS;
+    return [
+      {
+        type: 'content',
+        content: {
+          type: 'text',
+          text: `… ${omitted.toLocaleString('en-US')} earlier characters omitted …\n${text.slice(omitted)}`,
+        },
+      },
+    ];
+  });
 }
 
 /**

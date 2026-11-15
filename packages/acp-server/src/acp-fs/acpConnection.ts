@@ -88,6 +88,23 @@ export interface AcpTerminalCreatedEvent {
 
 export type AcpTerminalCreatedListener = (event: AcpTerminalCreatedEvent) => void;
 
+/**
+ * How long a parked terminal release waits for the session to claim it
+ * (see {@link IAcpConnection.deferTerminalRelease}) before releasing on its
+ * own. The claim normally lands a few milliseconds after the command exits —
+ * it only fires when the terminal was never correlated with a tool call (a
+ * subagent's command, a cancelled turn), which must not leak the client-side
+ * terminal until the session closes.
+ */
+const DEFERRED_RELEASE_FALLBACK_MS = 5_000;
+
+/** A terminal whose `terminal/release` is parked until the session claims it. */
+interface DeferredTerminalRelease {
+  readonly sessionId: string;
+  readonly release: () => Promise<unknown>;
+  readonly timer: ReturnType<typeof setTimeout>;
+}
+
 export interface IAcpConnection {
   readonly _serviceBrand: undefined;
   /** Bind the process-wide ACP client connection. Later binds replace earlier ones. */
@@ -110,6 +127,30 @@ export interface IAcpConnection {
   notifyTerminalCreated(event: AcpTerminalCreatedEvent): void;
   /** Subscribe to terminal-created notifications. Returns an unsubscribe. */
   onTerminalCreated(listener: AcpTerminalCreatedListener): () => void;
+  /**
+   * Park a terminal's `terminal/release` until the session has reported the
+   * terminal's **final** state to the client.
+   *
+   * Ordering is load-bearing: the ACP runner disposes a process inside the
+   * Bash tool's `finally`, which runs BEFORE the engine publishes
+   * `tool.result`. Releasing there deletes the terminal at the client while
+   * the session still owes a `tool_call_update` for that call — and clients
+   * reject an update that references a terminal they no longer hold (Zed:
+   * `Terminal with id ... not found`), which wedges the client's whole
+   * session-update pipeline: no further UI updates land, the prompt never
+   * settles, yet the agent keeps working. Parking the release lets the
+   * session flush the final update first and then call
+   * {@link releaseTerminal}.
+   *
+   * The release is fire-and-forget — a client that never answers must not
+   * block the tool call. A fallback timer releases the terminal when no
+   * session claims it (uncorrelated call, cancelled turn, teardown).
+   */
+  deferTerminalRelease(sessionId: string, terminalId: string, release: () => Promise<unknown>): void;
+  /** Release a parked terminal now (idempotent; no-op for an unknown id). */
+  releaseTerminal(terminalId: string): void;
+  /** Release every terminal parked for a session (session teardown). */
+  releaseSessionTerminals(sessionId: string): void;
 }
 
 export const IAcpConnection: ServiceIdentifier<IAcpConnection> =
@@ -123,6 +164,7 @@ export class AcpConnection implements IAcpConnection {
   private _fsWriteTextFile = false;
   private _terminalEnabled = false;
   private readonly terminalCreatedListeners = new Set<AcpTerminalCreatedListener>();
+  private readonly deferredReleases = new Map<string, DeferredTerminalRelease>();
 
   bind(client: IAcpFsClient & IAcpTerminalClient): void {
     this.client = client;
@@ -177,6 +219,48 @@ export class AcpConnection implements IAcpConnection {
     return () => {
       this.terminalCreatedListeners.delete(listener);
     };
+  }
+
+  deferTerminalRelease(
+    sessionId: string,
+    terminalId: string,
+    release: () => Promise<unknown>,
+  ): void {
+    // A re-created id supersedes the parked entry (the client reuses ids
+    // freely); drop the stale timer so it cannot release the new terminal.
+    const previous = this.deferredReleases.get(terminalId);
+    if (previous !== undefined) clearTimeout(previous.timer);
+    const timer = setTimeout(() => {
+      this.runTerminalRelease(terminalId);
+    }, DEFERRED_RELEASE_FALLBACK_MS);
+    timer.unref?.();
+    this.deferredReleases.set(terminalId, { sessionId, release, timer });
+  }
+
+  releaseTerminal(terminalId: string): void {
+    this.runTerminalRelease(terminalId);
+  }
+
+  releaseSessionTerminals(sessionId: string): void {
+    for (const [terminalId, entry] of [...this.deferredReleases]) {
+      if (entry.sessionId === sessionId) this.runTerminalRelease(terminalId);
+    }
+  }
+
+  /**
+   * Take a parked release and run it. Errors are swallowed: a client that
+   * refuses a stale `terminal/release` must not surface as a turn failure.
+   */
+  private runTerminalRelease(terminalId: string): void {
+    const entry = this.deferredReleases.get(terminalId);
+    if (entry === undefined) return;
+    this.deferredReleases.delete(terminalId);
+    clearTimeout(entry.timer);
+    try {
+      void Promise.resolve(entry.release()).catch(() => {});
+    } catch {
+      // A synchronous throw from a broken client handle is equally harmless.
+    }
   }
 }
 
