@@ -1,5 +1,5 @@
 diff --git a/packages/acp-server/src/acp-fs/acpConnection.ts b/packages/acp-server/src/acp-fs/acpConnection.ts
-index 9d12773ec..873d4698e 100644
+index 9d12773ec1..bfb4e0dd7c 100644
 --- a/packages/acp-server/src/acp-fs/acpConnection.ts
 +++ b/packages/acp-server/src/acp-fs/acpConnection.ts
 @@ -88,6 +88,23 @@ export interface AcpTerminalCreatedEvent {
@@ -65,7 +65,7 @@ index 9d12773ec..873d4698e 100644
  
    bind(client: IAcpFsClient & IAcpTerminalClient): void {
      this.client = client;
-@@ -178,6 +220,48 @@ export class AcpConnection implements IAcpConnection {
+@@ -178,6 +220,50 @@ export class AcpConnection implements IAcpConnection {
        this.terminalCreatedListeners.delete(listener);
      };
    }
@@ -91,7 +91,9 @@ index 9d12773ec..873d4698e 100644
 +  }
 +
 +  releaseSessionTerminals(sessionId: string): void {
-+    for (const [terminalId, entry] of [...this.deferredReleases]) {
++    // Deleting the entry being visited is a documented no-op for Map
++    // iteration, so this needs no defensive copy.
++    for (const [terminalId, entry] of this.deferredReleases) {
 +      if (entry.sessionId === sessionId) this.runTerminalRelease(terminalId);
 +    }
 +  }
@@ -115,7 +117,7 @@ index 9d12773ec..873d4698e 100644
  
  registerScopedService(
 diff --git a/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts b/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts
-index 74908f72d..63270365f 100644
+index 74908f72d6..63270365fa 100644
 --- a/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts
 +++ b/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts
 @@ -72,7 +72,7 @@ class AcpProcessService implements IHostProcessService {
@@ -163,7 +165,7 @@ index 74908f72d..63270365f 100644
  
    private async run(): Promise<number> {
 diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/session.ts
-index e55de252b..6a415592c 100644
+index e55de252bb..6a415592c8 100644
 --- a/packages/acp-server/src/session.ts
 +++ b/packages/acp-server/src/session.ts
 @@ -29,6 +29,7 @@ import type {
@@ -325,7 +327,7 @@ index e55de252b..6a415592c 100644
   * Render the client-facing summary of a finished compaction (mirrors the
   * legacy adapter's wording).
 diff --git a/packages/acp-server/test/acp-fs.test.ts b/packages/acp-server/test/acp-fs.test.ts
-index 2d8941db1..54b12ed8a 100644
+index 2d8941db13..54b12ed8af 100644
 --- a/packages/acp-server/test/acp-fs.test.ts
 +++ b/packages/acp-server/test/acp-fs.test.ts
 @@ -34,6 +34,9 @@ function makeConnection(
@@ -339,7 +341,7 @@ index 2d8941db1..54b12ed8a 100644
  }
  
 diff --git a/packages/acp-server/test/acp-terminal.test.ts b/packages/acp-server/test/acp-terminal.test.ts
-index 5b5c1ca1b..a17d1fc93 100644
+index 5b5c1ca1b9..a17d1fc935 100644
 --- a/packages/acp-server/test/acp-terminal.test.ts
 +++ b/packages/acp-server/test/acp-terminal.test.ts
 @@ -13,9 +13,20 @@ import type { IAcpConnection, IAcpTerminalHandle } from '../src/acp-fs/acpConnec
@@ -422,7 +424,7 @@ index 5b5c1ca1b..a17d1fc93 100644
 +  });
  });
 diff --git a/packages/acp-server/test/e2e-turn.test.ts b/packages/acp-server/test/e2e-turn.test.ts
-index c0bd1d0cd..82aa345a4 100644
+index c0bd1d0cd0..82aa345a4c 100644
 --- a/packages/acp-server/test/e2e-turn.test.ts
 +++ b/packages/acp-server/test/e2e-turn.test.ts
 @@ -1111,13 +1111,29 @@ describe('acp-server terminal reverse-RPC (clientCapabilities.terminal)', () =>
