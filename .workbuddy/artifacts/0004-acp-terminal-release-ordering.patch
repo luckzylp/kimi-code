@@ -1,0 +1,460 @@
+diff --git a/packages/acp-server/src/acp-fs/acpConnection.ts b/packages/acp-server/src/acp-fs/acpConnection.ts
+index 9d12773ec..873d4698e 100644
+--- a/packages/acp-server/src/acp-fs/acpConnection.ts
++++ b/packages/acp-server/src/acp-fs/acpConnection.ts
+@@ -88,6 +88,23 @@ export interface AcpTerminalCreatedEvent {
+ 
+ export type AcpTerminalCreatedListener = (event: AcpTerminalCreatedEvent) => void;
+ 
++/**
++ * How long a parked terminal release waits for the session to claim it
++ * (see {@link IAcpConnection.deferTerminalRelease}) before releasing on its
++ * own. The claim normally lands a few milliseconds after the command exits —
++ * it only fires when the terminal was never correlated with a tool call (a
++ * subagent's command, a cancelled turn), which must not leak the client-side
++ * terminal until the session closes.
++ */
++const DEFERRED_RELEASE_FALLBACK_MS = 5_000;
++
++/** A terminal whose `terminal/release` is parked until the session claims it. */
++interface DeferredTerminalRelease {
++  readonly sessionId: string;
++  readonly release: () => Promise<unknown>;
++  readonly timer: ReturnType<typeof setTimeout>;
++}
++
+ export interface IAcpConnection {
+   readonly _serviceBrand: undefined;
+   /** Bind the process-wide ACP client connection. Later binds replace earlier ones. */
+@@ -110,6 +127,30 @@ export interface IAcpConnection {
+   notifyTerminalCreated(event: AcpTerminalCreatedEvent): void;
+   /** Subscribe to terminal-created notifications. Returns an unsubscribe. */
+   onTerminalCreated(listener: AcpTerminalCreatedListener): () => void;
++  /**
++   * Park a terminal's `terminal/release` until the session has reported the
++   * terminal's **final** state to the client.
++   *
++   * Ordering is load-bearing: the ACP runner disposes a process inside the
++   * Bash tool's `finally`, which runs BEFORE the engine publishes
++   * `tool.result`. Releasing there deletes the terminal at the client while
++   * the session still owes a `tool_call_update` for that call — and clients
++   * reject an update that references a terminal they no longer hold (Zed:
++   * `Terminal with id ... not found`), which wedges the client's whole
++   * session-update pipeline: no further UI updates land, the prompt never
++   * settles, yet the agent keeps working. Parking the release lets the
++   * session flush the final update first and then call
++   * {@link releaseTerminal}.
++   *
++   * The release is fire-and-forget — a client that never answers must not
++   * block the tool call. A fallback timer releases the terminal when no
++   * session claims it (uncorrelated call, cancelled turn, teardown).
++   */
++  deferTerminalRelease(sessionId: string, terminalId: string, release: () => Promise<unknown>): void;
++  /** Release a parked terminal now (idempotent; no-op for an unknown id). */
++  releaseTerminal(terminalId: string): void;
++  /** Release every terminal parked for a session (session teardown). */
++  releaseSessionTerminals(sessionId: string): void;
+ }
+ 
+ export const IAcpConnection: ServiceIdentifier<IAcpConnection> =
+@@ -123,6 +164,7 @@ export class AcpConnection implements IAcpConnection {
+   private _fsWriteTextFile = false;
+   private _terminalEnabled = false;
+   private readonly terminalCreatedListeners = new Set<AcpTerminalCreatedListener>();
++  private readonly deferredReleases = new Map<string, DeferredTerminalRelease>();
+ 
+   bind(client: IAcpFsClient & IAcpTerminalClient): void {
+     this.client = client;
+@@ -178,6 +220,48 @@ export class AcpConnection implements IAcpConnection {
+       this.terminalCreatedListeners.delete(listener);
+     };
+   }
++
++  deferTerminalRelease(
++    sessionId: string,
++    terminalId: string,
++    release: () => Promise<unknown>,
++  ): void {
++    // A re-created id supersedes the parked entry (the client reuses ids
++    // freely); drop the stale timer so it cannot release the new terminal.
++    const previous = this.deferredReleases.get(terminalId);
++    if (previous !== undefined) clearTimeout(previous.timer);
++    const timer = setTimeout(() => {
++      this.runTerminalRelease(terminalId);
++    }, DEFERRED_RELEASE_FALLBACK_MS);
++    timer.unref?.();
++    this.deferredReleases.set(terminalId, { sessionId, release, timer });
++  }
++
++  releaseTerminal(terminalId: string): void {
++    this.runTerminalRelease(terminalId);
++  }
++
++  releaseSessionTerminals(sessionId: string): void {
++    for (const [terminalId, entry] of [...this.deferredReleases]) {
++      if (entry.sessionId === sessionId) this.runTerminalRelease(terminalId);
++    }
++  }
++
++  /**
++   * Take a parked release and run it. Errors are swallowed: a client that
++   * refuses a stale `terminal/release` must not surface as a turn failure.
++   */
++  private runTerminalRelease(terminalId: string): void {
++    const entry = this.deferredReleases.get(terminalId);
++    if (entry === undefined) return;
++    this.deferredReleases.delete(terminalId);
++    clearTimeout(entry.timer);
++    try {
++      void Promise.resolve(entry.release()).catch(() => {});
++    } catch {
++      // A synchronous throw from a broken client handle is equally harmless.
++    }
++  }
+ }
+ 
+ registerScopedService(
+diff --git a/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts b/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts
+index 74908f72d..63270365f 100644
+--- a/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts
++++ b/packages/acp-server/src/acp-terminal/acpTerminalRunner.ts
+@@ -72,7 +72,7 @@ class AcpProcessService implements IHostProcessService {
+       shellCommand: args[1] ?? '',
+       terminalId: handle.id,
+     });
+-    return new AcpTerminalProcess(handle);
++    return new AcpTerminalProcess(handle, this.sessionId, this.connection);
+   }
+ }
+ 
+@@ -89,7 +89,11 @@ class AcpTerminalProcess implements IHostProcess {
+   private readonly waitPromise: Promise<number>;
+   private released = false;
+ 
+-  constructor(private readonly handle: IAcpTerminalHandle) {
++  constructor(
++    private readonly handle: IAcpTerminalHandle,
++    private readonly sessionId: string,
++    private readonly connection: IAcpConnection,
++  ) {
+     this.stdin = new Writable({
+       write(_chunk, _encoding, callback) {
+         callback();
+@@ -124,10 +128,17 @@ class AcpTerminalProcess implements IHostProcess {
+     if (this.released) return;
+     this.released = true;
+     this.stopPolling();
+-    try {
+-      await this.handle.release();
+-    } catch {
+-    }
++    // Hand the `terminal/release` to the connection instead of awaiting it
++    // here, for two independent reasons:
++    //  1. Ordering — `dispose()` runs inside the Bash tool's `finally`, i.e.
++    //     before the engine publishes `tool.result`. Releasing now deletes
++    //     the terminal at the client while the session still owes that call a
++    //     final `tool_call_update`; clients reject such an update ("Terminal
++    //     with id ... not found") and their session-update pipeline wedges.
++    //     The session claims the parked release after pushing the update.
++    //  2. Liveness — a reverse-RPC awaited on this path leaves the whole tool
++    //     call (and the turn) hostage to a client that never answers.
++    this.connection.deferTerminalRelease(this.sessionId, this.handle.id, () => this.handle.release());
+   }
+ 
+   private async run(): Promise<number> {
+diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/session.ts
+index e55de252b..6a415592c 100644
+--- a/packages/acp-server/src/session.ts
++++ b/packages/acp-server/src/session.ts
+@@ -29,6 +29,7 @@ import type {
+   SessionConfigOption,
+   SessionModeState,
+   SessionNotification,
++  ToolCallContent,
+   ToolCallLocation,
+ } from '@agentclientprotocol/sdk';
+ import { RequestError } from '@agentclientprotocol/sdk';
+@@ -63,7 +64,7 @@ import {
+   runBuiltinSlashCommand,
+ } from './builtin-commands';
+ import { buildSessionConfigOptions } from './config-options';
+-import { acpBlocksToContentParts, compressPromptImageParts } from './convert';
++import { acpBlocksToContentParts, compressPromptImageParts, toolResultToAcpContent } from './convert';
+ import {
+   acpToolCallId,
+   availableCommandsUpdateNotification,
+@@ -283,11 +284,13 @@ export class AcpSession {
+   private readonly bashCallsAwaitingTerminal = new Map<string, string>();
+   /**
+    * Tool calls whose execution runs in a client terminal: ACP wire toolCallId
+-   * → terminalId. Their terminal `tool_call_update` carries a
+-   * `{type: 'terminal'}` content entry instead of the textual output (the
+-   * client already renders the bytes in the terminal pane — showing them in
+-   * the card too would duplicate them). The model still receives the full
+-   * captured output; only the client-facing card content is de-duplicated.
++   * → terminalId. The terminal is attached to the card as a
++   * `{type: 'terminal'}` content entry while the command runs; the terminal
++   * *result* replaces it with the captured output (see
++   * {@link settleTerminalBackedCall}), because the terminal is released right
++   * after that update and the client stops holding it. The model always
++   * receives the full captured output; only the client-facing card content
++   * changes shape.
+    */
+   private readonly terminalBackedCalls = new Map<string, string>();
+   /** Bridges engine approval / ask-user requests to the ACP client. */
+@@ -454,6 +457,10 @@ export class AcpSession {
+     for (const subscription of this.subscriptions.splice(0)) {
+       subscription.dispose();
+     }
++    // Safety net: a terminal whose tool call never reported a result (turn
++    // cancelled, subagent command) is parked on the connection and would
++    // otherwise linger until the fallback timer fires on a dead session.
++    this.acpConnection.releaseSessionTerminals(this.sessionId);
+   }
+ 
+   /**
+@@ -920,25 +927,61 @@ export class AcpSession {
+     const terminalId = this.terminalBackedCalls.get(key);
+     this.terminalBackedCalls.delete(key);
+     if (terminalId !== undefined) {
+-      // Terminal-backed call: the client already renders the output bytes in
+-      // the terminal pane, so the card gets the terminal embed instead of a
+-      // textual copy. The full output still reached the model (and the
+-      // persisted wire record) untouched.
+-      this.emit({
++      void this.settleTerminalBackedCall(key, terminalId, event, locations);
++      return;
++    }
++    this.emit(
++      toolResultToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, locations),
++    );
++  }
++
++  /**
++   * Close out a Bash call that ran in a client terminal, then release that
++   * terminal.
++   *
++   * The final `tool_call_update` carries the captured output as text instead
++   * of a `{type: 'terminal'}` embed: the embed is only valid while the client
++   * still holds the terminal, and releasing it (right after this update) is
++   * exactly what makes the client drop it. An update that still referenced it
++   * would be rejected by the client — Zed answers
++   * `Terminal with id ... not found` and stops applying session updates for
++   * the thread, so the turn's UI freezes while the agent keeps running.
++   *
++   * The release is claimed only once the update is on the wire, which is what
++   * keeps the client's view of the terminal alive long enough to render the
++   * in-progress embed emitted at `terminal/create`.
++   */
++  private async settleTerminalBackedCall(
++    key: string,
++    terminalId: string,
++    event: AgentEventPayloads['tool.result'],
++    locations: ToolCallLocation[] | undefined,
++  ): Promise<void> {
++    try {
++      await this.conn.sessionUpdate({
+         sessionId: this.sessionId,
+         update: {
+           sessionUpdate: 'tool_call_update',
+           toolCallId: key,
+           status: event.isError === true ? 'failed' : 'completed',
+-          content: [{ type: 'terminal', terminalId }],
++          content: terminalResultPreview(event as unknown as ToolResultEvent),
++          // No `rawOutput`: the captured output can reach ~10 MB, and this
++          // update is a single JSON-RPC frame. The card gets a bounded tail
++          // preview instead — the model already received the full output, and
++          // the client rendered the live bytes in its terminal pane.
+           locations,
+         },
+       });
+-      return;
++    } catch (error) {
++      log.warn('acp: failed to push terminal tool_call_update', {
++        sessionId: this.sessionId,
++        toolCallId: key,
++        terminalId,
++        error: error instanceof Error ? error.message : String(error),
++      });
++    } finally {
++      this.acpConnection.releaseTerminal(terminalId);
+     }
+-    this.emit(
+-      toolResultToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, locations),
+-    );
+   }
+ 
+   /**
+@@ -1319,6 +1362,38 @@ export class AcpSession {
+   }
+ }
+ 
++/**
++ * Bound on the textual preview a terminal-backed call puts on its card. The
++ * captured output can reach ~10 MB (`DEFAULT_TOOL_RESULT_MAX_RETAINED_CHARS`
++ * in the engine), and this update travels as a single JSON-RPC frame, so the
++ * card gets the trailing window — where failures surface — and a note saying
++ * how much was dropped.
++ */
++const TERMINAL_RESULT_PREVIEW_CHARS = 16 * 1024;
++
++/**
++ * Project a tool result into card content, keeping at most
++ * {@link TERMINAL_RESULT_PREVIEW_CHARS} characters of any text entry (the
++ * tail). Non-text entries pass through untouched.
++ */
++function terminalResultPreview(event: ToolResultEvent): ToolCallContent[] {
++  return toolResultToAcpContent(event).flatMap((entry): ToolCallContent[] => {
++    if (entry.type !== 'content' || entry.content.type !== 'text') return [entry];
++    const text = entry.content.text;
++    if (text.length <= TERMINAL_RESULT_PREVIEW_CHARS) return [entry];
++    const omitted = text.length - TERMINAL_RESULT_PREVIEW_CHARS;
++    return [
++      {
++        type: 'content',
++        content: {
++          type: 'text',
++          text: `… ${omitted.toLocaleString('en-US')} earlier characters omitted …\n${text.slice(omitted)}`,
++        },
++      },
++    ];
++  });
++}
++
+ /**
+  * Render the client-facing summary of a finished compaction (mirrors the
+  * legacy adapter's wording).
+diff --git a/packages/acp-server/test/acp-fs.test.ts b/packages/acp-server/test/acp-fs.test.ts
+index 2d8941db1..54b12ed8a 100644
+--- a/packages/acp-server/test/acp-fs.test.ts
++++ b/packages/acp-server/test/acp-fs.test.ts
+@@ -34,6 +34,9 @@ function makeConnection(
+     bindTerminalCapability: () => {},
+     notifyTerminalCreated: () => {},
+     onTerminalCreated: () => () => {},
++    deferTerminalRelease: () => {},
++    releaseTerminal: () => {},
++    releaseSessionTerminals: () => {},
+   };
+ }
+ 
+diff --git a/packages/acp-server/test/acp-terminal.test.ts b/packages/acp-server/test/acp-terminal.test.ts
+index 5b5c1ca1b..a17d1fc93 100644
+--- a/packages/acp-server/test/acp-terminal.test.ts
++++ b/packages/acp-server/test/acp-terminal.test.ts
+@@ -13,9 +13,20 @@ import type { IAcpConnection, IAcpTerminalHandle } from '../src/acp-fs/acpConnec
+ import { AcpHostFileSystem } from '../src/acp-fs/acpFsService';
+ import { AcpEnvironmentProviderFactory } from '../src/acp-terminal/acpTerminalRunner';
+ 
++interface DeferredRelease {
++  readonly sessionId: string;
++  readonly terminalId: string;
++  readonly release: () => Promise<unknown>;
++}
++
+ function makeConnection(
+-  options: { terminalEnabled?: boolean; createTerminal?: () => IAcpTerminalHandle } = {},
++  options: {
++    terminalEnabled?: boolean;
++    createTerminal?: () => IAcpTerminalHandle;
++    deferred?: DeferredRelease[];
++  } = {},
+ ): IAcpConnection {
++  const deferred = options.deferred ?? [];
+   return {
+     _serviceBrand: undefined,
+     bound: true,
+@@ -28,6 +39,11 @@ function makeConnection(
+     bindTerminalCapability: () => {},
+     notifyTerminalCreated: () => {},
+     onTerminalCreated: () => () => {},
++    deferTerminalRelease: (sessionId, terminalId, release) => {
++      deferred.push({ sessionId, terminalId, release });
++    },
++    releaseTerminal: () => {},
++    releaseSessionTerminals: () => {},
+   };
+ }
+ 
+@@ -197,4 +213,44 @@ describe('AcpProcessService local fallback', () => {
+     expect(calls).toHaveLength(1);
+     expect(calls[0]).toMatchObject({ command: 'rg', args: ['--files', '--hidden'], options: { cwd: '/repo' } });
+   });
++
++  it('parks the client release on dispose instead of releasing inline', async () => {
++    const releases: string[] = [];
++    const handle: IAcpTerminalHandle = {
++      id: 'term-park',
++      currentOutput: async () => ({ output: '', truncated: false }),
++      waitForExit: async () => ({ exitCode: 0 }),
++      kill: async () => ({}),
++      release: async () => {
++        releases.push('released');
++        return {};
++      },
++    };
++    const deferred: DeferredRelease[] = [];
++    const connection = makeConnection({ terminalEnabled: true, createTerminal: () => handle, deferred });
++    const environment = await bindEnvironment(makeEnvironment(), { connection });
++
++    const proc = await environment.process!.spawn('/bin/bash', ['-c', 'echo hi'], {
++      env: { NO_COLOR: '1', TERM: 'dumb' },
++    });
++
++    // `dispose()` runs inside the Bash tool's `finally`, i.e. BEFORE the
++    // engine publishes `tool.result`. Releasing here would delete the
++    // terminal at the client while the session still owes that call a final
++    // `tool_call_update`; the update would then be rejected ("Terminal with
++    // id ... not found"). The release must therefore be parked.
++    await proc.dispose();
++    expect(releases).toEqual([]);
++    expect(deferred).toHaveLength(1);
++    expect(deferred[0]).toMatchObject({ sessionId: 's1', terminalId: 'term-park' });
++
++    // Idempotent: a second dispose parks nothing more.
++    await proc.dispose();
++    expect(deferred).toHaveLength(1);
++
++    // The session claims the parked release once the final update is on the
++    // wire, and it releases exactly once.
++    await deferred[0]!.release();
++    expect(releases).toEqual(['released']);
++  });
+ });
+diff --git a/packages/acp-server/test/e2e-turn.test.ts b/packages/acp-server/test/e2e-turn.test.ts
+index c0bd1d0cd..82aa345a4 100644
+--- a/packages/acp-server/test/e2e-turn.test.ts
++++ b/packages/acp-server/test/e2e-turn.test.ts
+@@ -1111,13 +1111,29 @@ describe('acp-server terminal reverse-RPC (clientCapabilities.terminal)', () =>
+     expect(t.released).toBe(true);
+     expect(t.killed).toBe(false);
+ 
+-    // The tool card carries the terminal embed — not a textual copy of the
+-    // output (the client already renders the bytes in the terminal pane).
++    // The card embeds the live client terminal while the command runs…
+     const updates = toolCallUpdates(c);
+     const attached = updates.find((u) => u.content?.[0]?.type === 'terminal');
+     expect(attached?.content?.[0]?.terminalId).toBe(t.id);
++    // …and the final update replaces that embed with the captured output.
++    // The client drops the terminal as soon as it is released, so an update
++    // that still referenced the terminal id would be rejected (Zed answers
++    // `Terminal with id ... not found` and stops applying that thread's
++    // session updates: the UI freezes while the agent keeps running).
+     const completed = updates.find((u) => u.status === 'completed');
+-    expect(completed?.content).toEqual([{ type: 'terminal', terminalId: t.id }]);
++    expect(completed?.content).toEqual([
++      { type: 'content', content: { type: 'text', text: expect.stringContaining('hello_from_terminal') } },
++    ]);
++
++    // Ordering guarantee: the final update reaches the client BEFORE the
++    // release that deletes the terminal it used to embed.
++    const completedIndex = c.received.findIndex((m) => {
++      const update = (m.params as { update?: ToolCallUpdate } | undefined)?.update;
++      return update?.sessionUpdate === 'tool_call_update' && update.status === 'completed';
++    });
++    const releaseIndex = c.received.findIndex((m) => m.method === 'terminal/release');
++    expect(completedIndex).toBeGreaterThan(-1);
++    expect(releaseIndex).toBeGreaterThan(completedIndex);
+ 
+     // …while the model still received the captured output in the tool
+     // result fed back on the second generate() call.

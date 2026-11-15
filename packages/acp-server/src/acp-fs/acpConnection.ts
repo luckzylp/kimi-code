@@ -242,7 +242,9 @@ export class AcpConnection implements IAcpConnection {
   }
 
   releaseSessionTerminals(sessionId: string): void {
-    for (const [terminalId, entry] of [...this.deferredReleases]) {
+    // Deleting the entry being visited is a documented no-op for Map
+    // iteration, so this needs no defensive copy.
+    for (const [terminalId, entry] of this.deferredReleases) {
       if (entry.sessionId === sessionId) this.runTerminalRelease(terminalId);
     }
   }
